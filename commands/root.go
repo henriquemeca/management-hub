@@ -30,6 +30,11 @@ var versionCmd = &cobra.Command{
 func Execute() {
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(feedCmd)
+	rootCmd.AddCommand(uiCmd)
+	// wos sem args = a TUI (mesmo code path do `wos ui`) — a mesa única.
+	rootCmd.RunE = func(cmd *cobra.Command, args []string) error {
+		return runUI(false)
+	}
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
