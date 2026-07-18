@@ -1,7 +1,14 @@
 BIN_DIR := $(HOME)/.local/bin
 SCRIPTS := work attn wos triage linear-sync ship
 
-.PHONY: link unlink check
+.PHONY: build test link unlink check
+
+## build: compila a CLI Go em dist/wos (não conflita com bin/wos zsh até a graduação)
+build:
+	go build -o dist/wos .
+
+test:
+	go test ./...
 
 ## link: symlinka bin/* em ~/.local/bin (caminhos que tmux/nvim/automations já usam)
 link:

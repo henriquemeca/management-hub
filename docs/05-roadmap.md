@@ -2,7 +2,8 @@
 
 ## Fase 0 — fundação (este commit)
 
-- Repo criado com conceitos (`docs/`), scaffold Python e os scripts v1 migrados dos
+- Repo criado com conceitos (`docs/`), CLI Go (padrão kan: `main.go` +
+  `commands/`, decisão revisada na HEN-52) e os scripts v1 migrados dos
   dotfiles para `bin/` (instalados via `make link` → `~/.local/bin`, preservando os
   caminhos que tmux/nvim já usam). Dotfiles volta a ser só configuração de máquina.
 - Projeto Linear `management-hub` (team HEN) criado; melhorias tracked lá e
@@ -39,7 +40,7 @@ Ordem por alavancagem; detalhes nas issues do projeto Linear:
 10. **Serializar a integração em lote**: branch protection na dev (1 status check)
     + `gh pr merge --squash --auto`.
 11. **Graduar o motor**: parsers de trailer, ordenação da fila, rubrica/recálculo e
-    máquina de rodadas do triage → `src/wos/` com pytest (primeiro teste: regressão
+    máquina de rodadas do triage → comandos Go em `commands/` com testes (primeiro: regressão
     HEN-37). Wrappers zsh finos mantêm a UX; `bin/` encolhe até ser só cola.
 
 ## Fase 3 — DEPOIS
@@ -47,14 +48,14 @@ Ordem por alavancagem; detalhes nas issues do projeto Linear:
 12. **CLI `wos` unificada** com `--json` em tudo — o contrato congela; automations
     e painéis passam a consumir a CLI.
 13. **`retro`** manual (1 proposta por vez, marco no ledger).
-14. **TUI (Textual)** sobre o mesmo core/feed, refresh vivo. Última milha sobre um
+14. **TUI (bubbletea)** sobre o mesmo core/feed, refresh vivo. Última milha sobre um
     feed estável — nunca a fundação.
 15. **Upstream Orca**: quando o launcher nativo expuser `--model/--effort`, o
     workaround de `terminal send` (~80 linhas do linear-sync) morre.
 
 ## Critérios de graduação script→core (os gatilhos que já dispararam)
 
-Um componente migra de `bin/` (zsh) para `src/wos/` (Python testado) quando:
+Um componente migra de `bin/` (zsh) para `commands/` (Go testado) quando:
 contrato compartilhado ganharia 2ª cópia ou já causou bug em dogfood (✔ ordenação
 duplicada, ✔ parser HEN-37); há hesitação em mudar lógica por não poder testá-la
 (✔ recalc/downgrade do triage); vai rodar agendado/daemon (✔ triage em automation);

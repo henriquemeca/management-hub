@@ -1,0 +1,9 @@
+# workmux — config do repo (sobrepõe a global de ~/.config/workmux/config.yaml).
+# Worktrees de task partem da dev (contrato do ciclo: PR contra dev + squash;
+# review humana concentrada no PR dev→main). Fechamento é do `ship`, não do
+# `workmux merge`.
+base_branch: dev
+main_branch: dev
+
+post_create:
+  - make link

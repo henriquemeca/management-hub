@@ -28,14 +28,17 @@ antes de mexer em qualquer lógica de estado**.
 
 ## Tooling
 
-- **Python 3.12+**, gerenciado com **uv** (`uv sync`, `uv run`).
-- Layout `src/` — pacote `wos`, CLI via entry point `wos`.
-- **pytest** para testes (todo código do core nasce com teste — o motivo da graduação
-  dos scripts zsh foi exatamente ser intestável lá).
-- **ruff** para lint + format.
-- TUI (estágio 3): **Textual**. Não adicionar antes do feed JSON estabilizar.
-- Contratos JSON (feed do snapshot, ledger, trailers) são API pública: mudanças
-  exigem versionamento e teste de regressão.
+- **Go 1.23+** — CLI única `wos` no padrão do ~/github/kan: `main.go` +
+  `commands/` (cobra); `make build` → `dist/wos`, `make test` → `go test ./...`.
+- Todo código do core nasce com teste — o motivo da graduação dos scripts zsh
+  foi exatamente ser intestável lá.
+- Execução de sessões/worktrees: **workmux** (perfis de agente em
+  `~/.config/workmux/config.yaml`, dotfiles). Nunca usar `workmux merge` — o
+  fechamento é do `ship`.
+- TUI (estágio 3): **bubbletea** (padrão k9s/gh-dash), como pacote `ui/`.
+  Não adicionar antes do contrato de `wos feed --json` estabilizar.
+- Contratos JSON (feed, ledger, trailers) são API pública: mudanças exigem
+  versionamento e teste de regressão.
 
 ## Convenções
 
@@ -50,10 +53,12 @@ antes de mexer em qualquer lógica de estado**.
   - Fila: prioridade Linear (urgent→low, sem-prioridade por último), depois número
     da key — computada num único lugar, painéis apenas renderizam.
 - Scripts zsh em `bin/` (`work`, `attn`, `wos`, `triage`, `linear-sync`, `ship`)
-  são a implementação vigente até a graduação para `src/wos/` — ao portar lógica,
-  escrever primeiro o teste de regressão do comportamento real deles (incluindo o
-  caso HEN-37: trailer citado como exemplo no body). Instalação: `make link`
-  (symlinks em `~/.local/bin`); os bindings tmux/nvim vivem nos dotfiles.
+  são a implementação vigente até a graduação para comandos Go em `commands/` —
+  ao portar lógica, escrever primeiro o teste de regressão do comportamento real
+  deles (incluindo o caso HEN-37: trailer citado como exemplo no body).
+  Instalação: `make link` (symlinks em `~/.local/bin`); os bindings tmux/nvim
+  vivem nos dotfiles. O binário Go fica em `dist/wos` até ter paridade — só
+  então substitui o `bin/wos` no link.
 
 ## O que NÃO fazer
 

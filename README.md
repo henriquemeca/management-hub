@@ -20,18 +20,19 @@ Integra as ferramentas existentes **por projeção e despacho**, nunca por dupli
   (fila→spawn), `wos` (cockpit), `attn` (painel de atenção), `ship` (fechamento).
   Instalados com `make link` (symlinks em `~/.local/bin` — os caminhos que
   tmux/nvim/automations já usam). O dotfiles mantém só os bindings (tmux
-  `prefix+W`/`prefix+A`, `:Work` no nvim).
-- **`src/wos/`** — o core Python: os scripts graduam para cá com testes.
+  `prefix+W`/`prefix+A`, `:Work` no nvim) e a config do workmux.
+- **`main.go` + `commands/`** — a CLI Go (`wos`, padrão do kan): os scripts
+  graduam para cá com testes; `wos feed --json` é o contrato das superfícies.
 - **`docs/`** — os conceitos e contratos do sistema.
 
 ## Estágios
 
 1. **Hub v1 (fzf)** — fusão de `attn`+`wos` em `bin/` sobre um `snapshot.json`;
    valida o modelo de interação pelo preço de um script.
-2. **CLI `wos`** — motor graduado (parsers, fila, triagem, spawn) como biblioteca
-   Python testada + CLI com `--json` em tudo. A CLI é a superfície de automação:
-   as automations do Orca chamam ela, o painel renderiza ela.
-3. **TUI (Textual)** — casca sobre o mesmo core e o mesmo feed, refresh vivo.
+2. **CLI `wos`** (Go/cobra) — motor graduado (parsers, fila, triagem, spawn) com
+   `--json` em tudo; spawn de sessões delegado ao **workmux**. A CLI é a
+   superfície de automação: cron/automations chamam ela, o painel renderiza ela.
+3. **TUI (bubbletea)** — casca sobre o mesmo core e o mesmo feed, refresh vivo.
    O TUI é um renderizador; **o produto é o core + o feed**.
 
 ## Conceitos
@@ -53,7 +54,8 @@ graduação (ver roadmap), não por big-bang. Tracking no projeto Linear
 ## Dev
 
 ```bash
-uv sync          # instala deps (Python 3.12+)
-uv run pytest    # testes
-uv run ruff check && uv run ruff format --check
+make build   # go build -o dist/wos .
+make test    # go test ./...
+make link    # symlinks bin/* em ~/.local/bin
+make check   # smoke: --help de cada script
 ```

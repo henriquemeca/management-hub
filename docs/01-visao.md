@@ -28,8 +28,8 @@ captura (work) → triagem (interview assíncrono, Backlog→Todo)
 | Estágio | Onde | O quê |
 |---|---|---|
 | v1 — hub fzf | dotfiles | `attn`+`wos` fundidos sobre `snapshot.json`; valida a UX barato |
-| v2 — CLI `wos` | este repo | motor graduado (parsers, fila, triagem, spawn) como lib Python testada; CLI com `--json` em tudo; automations do Orca chamam a CLI |
-| v3 — TUI | este repo | Textual sobre o mesmo core/feed, refresh vivo (watcher + `orchestration check --peek` como trigger) |
+| v2 — CLI `wos` | este repo | motor graduado (parsers, fila, triagem, spawn) em Go (cobra) com testes; `--json` em tudo; spawn delegado ao workmux; cron/automations chamam a CLI |
+| v3 — TUI | este repo | bubbletea sobre o mesmo core/feed, refresh vivo (watcher como trigger) |
 
 **Tese central: o TUI é um renderizador; o produto é o core + o feed.** O padrão é o
 mesmo de k9s, lazygit e gh-dash — projeções TUI sobre APIs que existem sem elas.
