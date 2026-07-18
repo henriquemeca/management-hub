@@ -1,16 +1,26 @@
 #!/bin/zsh
-# wos — cockpit de coordenação do Work OS: quem roda, quem espera, e spawn
-# consciente de modelo+effort por task (HEN-38).
+# wos — hub do Work OS: visão unificada e ponto de entrada único do ciclo.
 #
 # Uso:
-#   wos                  interativo (fzf): rodando + fila. Enter numa issue da
-#                        fila → escolhe modelo/effort e spawna; enter numa
-#                        rodando → foca o pane no app Orca (como o attn).
-#   wos ps [--tsv]       visão de coordenação (texto): rodando + fila
+#   wos                  interativo (fzf): pendências + rodando + fila numa tela.
+#                        enter: pendência/rodando foca o pane · fila escolhe
+#                        modelo/effort e spawna
+#   wos ps [--tsv]       a mesma visão unificada em texto (--tsv = feed cru
+#                        `kind \t handle \t label`, proto-contrato do hub)
 #   wos spawn <KEY> [--model sonnet|opus|haiku] [--effort low|medium|high]
 #                  [--agent claude|…] [--dry-run]
 #                        disparo individual consciente. Sem flags → trailer
 #                        agent-config da issue, senão política default.
+#   wos peek <KEY> [n]   últimas n linhas (default 40) do terminal do agente —
+#                        a sessão do Orca lida do SEU terminal
+#   wos say <KEY> <txt…> envia texto (com Enter) ao terminal do agente
+#   wos go <KEY>         no tmux: abre janela no diretório do worktree;
+#                        fora: imprime o caminho (cd "$(wos go HEN-42)")
+#   wos capture [...]    → work      (captura crua; alias: wos work)
+#   wos triage [...]     → triage    (refinamento Backlog→Todo)
+#   wos sync [...]       → linear-sync (fila→spawn em lote)
+#   wos ship [...]       → ship      (fechamento: Done + worktree)
+#   wos attn [...]       → attn      (painel de pendências puro)
 #
 # Política default de modelo/effort:
 #   sonnet/medium   rotina — task bem especificada, bugfix com repro
@@ -18,10 +28,12 @@
 #   haiku/low       mecânico — rename, config, doc, mudança trivial
 # Por issue: trailer "agent-config: `model=<m> effort=<e>`" no body (mesmo
 # estilo do trailer repo:). Precedência: flags CLI > trailer > default.
-#
+
 # Motor de spawn: linear-sync --only <KEY> com overrides via env
 # (LINEAR_SYNC_MODEL/LINEAR_SYNC_EFFORT/LINEAR_SYNC_AGENT) — resolução de
 # trailer, dedup e cap vivem lá; wos não duplica essa lógica.
+# Pendências: attn --tsv é a fonte (gates, msgs, agents esperando, órfãos);
+# wos não duplica essa coleta.
 # Fila: issues Todo do team (WORK_LINEAR_TEAM, default HEN), na ordem que o
 # linear-sync consome: prioridade Linear (urgent→low, sem prioridade por
 # último), depois key — contrato compartilhado com o linear-sync.
@@ -46,11 +58,11 @@ die() {
 typeset -a VALID_MODELS=(sonnet opus haiku)
 typeset -a VALID_EFFORTS=(low medium high)
 
-# linear-sync mora ao lado do wos (repo ou ~/.local/bin, ambos stowed).
-sync_bin() {
-  local s="${SELF:A:h}/linear-sync"
+# Os demais comandos do ciclo moram ao lado do wos (bin/ do repo, ou PATH).
+sibling() {
+  local s="${SELF:A:h}/$1"
   [[ -x "$s" ]] && { print -r -- "$s"; return }
-  command -v linear-sync || die "linear-sync não encontrado (é o motor do spawn)"
+  command -v "$1" || die "$1 não encontrado (esperado ao lado do wos)"
 }
 
 # Emite TSV `kind \t handle \t label`:
@@ -123,18 +135,72 @@ for _, p, _, key, title in sorted(todo):
 PY
 }
 
+# Visão unificada: pendências (attn --tsv, sem as linhas summary) + rodando + fila.
+gather_all() {
+  local pend rows
+  pend=$("$(sibling attn)" --tsv 2>/dev/null |
+    awk -F'\t' '$1 ~ /^(gate:|msg:|input$|orphan$)/')
+  rows=$(gather_rows) || return 1
+  [[ -n "$pend" ]] && print -r -- "$pend"
+  [[ -n "$rows" ]] && print -r -- "$rows"
+  return 0
+}
+
+# KEY → `handle \t path \t name` do worktree ativo vinculado (1º terminal vivo).
+resolve_wt() {
+  local key="${(U)1}" wt_json terms_json
+  wt_json=$(orca worktree list --json 2>/dev/null)
+  terms_json=$(orca terminal list --json 2>/dev/null)
+  KEY="$key" python3 - "$wt_json" "$terms_json" <<'PY'
+import json, os, sys
+
+def load(raw):
+    try:
+        d = json.loads(raw, strict=False)
+        return d.get("result", {}) if d.get("ok") else {}
+    except Exception:
+        return {}
+
+wts, terms = (load(a) for a in sys.argv[1:3])
+key = os.environ["KEY"]
+by_wt = {}
+for t in terms.get("terminals", []):
+    by_wt.setdefault(t["worktreeId"], t["handle"])
+for w in wts.get("worktrees", []):
+    if w.get("isArchived") or w.get("linkedLinearIssue") != key:
+        continue
+    print(f'{by_wt.get(w.get("id", ""), "")}\t{w.get("path", "")}\t{w.get("displayName", "")}')
+    break
+PY
+}
+
+require_wt() {
+  local key="${(U)1}" row
+  row=$(resolve_wt "$key")
+  [[ -n "$row" ]] || die "nenhum worktree ativo vinculado a $key"
+  print -r -- "$row"
+}
+
 # ---------- wos ps ----------
 cmd_ps() {
   local tsv=0
   [[ "$1" == --tsv ]] && tsv=1
   local rows
-  rows=$(gather_rows) || exit 1
+  rows=$(gather_all) || exit 1
   if (( tsv )); then
     print -r -- "$rows"
     return
   fi
+  local -a pend=( ${(f)"$(print -r -- "$rows" |
+    awk -F'\t' '$1 ~ /^(gate:|msg:|input$|orphan$)/')"} )
   local -a run=( ${(f)"$(print -r -- "$rows" | grep '^run:')"} )
   local -a queue=( ${(f)"$(print -r -- "$rows" | grep '^queue:')"} )
+  print "pendências (${#pend[@]}):"
+  if (( ${#pend[@]} )); then
+    for r in "${pend[@]}"; do print "  ${r##*$'\t'}"; done
+  else
+    print "  (nenhuma — nada precisa de você)"
+  fi
   print "rodando (${#run[@]}/cap $CAP):"
   if (( ${#run[@]} )); then
     for r in "${run[@]}"; do print "  ${r##*$'\t'}"; done
@@ -177,20 +243,59 @@ cmd_spawn() {
   [[ -n "$agent" ]] && envv+=("LINEAR_SYNC_AGENT=$agent")
   local -a args=(--only "$key")
   (( dry )) && args+=(--dry-run)
-  env "${envv[@]}" "$(sync_bin)" "${args[@]}"
+  env "${envv[@]}" "$(sibling linear-sync)" "${args[@]}"
 }
 
-# ---------- interativo (default) ----------
+# ---------- wos peek / say / go — a sessão do Orca no seu terminal ----------
+cmd_peek() {
+  local key="$1" n="${2:-40}"
+  [[ -n "$key" ]] || die "uso: wos peek <KEY> [linhas]"
+  local row handle
+  row=$(require_wt "$key") || exit 1
+  handle="${row%%$'\t'*}"
+  [[ -n "$handle" ]] || die "worktree de ${(U)key} não tem terminal vivo"
+  orca terminal read --terminal "$handle" --limit "$n"
+}
+
+cmd_say() {
+  local key="$1"
+  (( $# )) && shift
+  [[ -n "$key" && $# -gt 0 ]] || die "uso: wos say <KEY> <texto…>"
+  local row handle
+  row=$(require_wt "$key") || exit 1
+  handle="${row%%$'\t'*}"
+  [[ -n "$handle" ]] || die "worktree de ${(U)key} não tem terminal vivo"
+  orca terminal send --terminal "$handle" --text "$*" --enter --json >/dev/null 2>&1 &&
+    print "→ enviado ao agente de ${(U)key}" ||
+    die "falha ao enviar (pane morto?)"
+}
+
+cmd_go() {
+  local key="$1"
+  [[ -n "$key" ]] || die "uso: wos go <KEY>"
+  local row rest wpath
+  row=$(require_wt "$key") || exit 1
+  rest="${row#*$'\t'}"
+  wpath="${rest%%$'\t'*}"
+  [[ -d "$wpath" ]] || die "diretório do worktree não existe: $wpath"
+  if [[ -n "$TMUX" ]]; then
+    tmux new-window -c "$wpath" -n "${(U)key}"
+  else
+    print -r -- "$wpath"
+  fi
+}
+
+# ---------- interativo (default): visão unificada ----------
 cmd_fzf() {
   command -v fzf >/dev/null || { cmd_ps; return }
   local rows
-  rows=$(gather_rows) || exit 1
-  [[ -z "$rows" ]] && { print "wos: nada rodando e fila vazia"; return }
+  rows=$(gather_all) || exit 1
+  [[ -z "$rows" ]] && { print "wos: nada rodando, sem pendências, fila vazia"; return }
 
   local sel
   sel=$(print -r -- "$rows" |
     fzf --delimiter '\t' --with-nth 3 --no-multi \
-        --header "● rodando: enter foca o pane · ○ fila: enter escolhe modelo/effort e spawna" \
+        --header "⛔✉⏸ pendência / ● rodando: enter foca · ○ fila: enter spawna · peek/say/go via CLI" \
         --prompt 'wos> ' --height=100% --layout=reverse)
   [[ -z "$sel" ]] && return
 
@@ -200,11 +305,17 @@ cmd_fzf() {
   local label="${rest#*$'\t'}"
 
   case "$kind" in
-    run:*)
+    run:*|input|orphan|gate:*|msg:*)
       if [[ -n "$handle" ]] && orca terminal switch --terminal "$handle" --json >/dev/null 2>&1; then
         print "→ focado no app Orca: $label"
       else
-        print -u2 "wos: pane não encontrado para ${kind#run:}"
+        print -r -- "$label"
+        case "$kind" in
+          gate:*) print "resolver: orca orchestration gate-resolve --id ${kind#gate:} --resolution '<texto>'" ;;
+          msg:*)  print "responder: orca orchestration reply --id ${kind#msg:} --body '<texto>'" ;;
+          run:*)  print -u2 "wos: pane não encontrado para ${kind#run:}" ;;
+          *)      print "(pendência sem pane associado)" ;;
+        esac
       fi
       ;;
     queue:*)
@@ -238,8 +349,16 @@ cmd_fzf() {
 
 case "$1" in
   -h|--help) usage; exit 0 ;;
-  ps)    shift; cmd_ps "$@" ;;
-  spawn) shift; cmd_spawn "$@" ;;
-  "")    cmd_fzf ;;
-  *)     usage >&2; die "subcomando desconhecido: $1" ;;
+  ps)           shift; cmd_ps "$@" ;;
+  spawn)        shift; cmd_spawn "$@" ;;
+  peek)         shift; cmd_peek "$@" ;;
+  say)          shift; cmd_say "$@" ;;
+  go)           shift; cmd_go "$@" ;;
+  capture|work) shift; exec "$(sibling work)" "$@" ;;
+  triage)       shift; exec "$(sibling triage)" "$@" ;;
+  sync)         shift; exec "$(sibling linear-sync)" "$@" ;;
+  ship)         shift; exec "$(sibling ship)" "$@" ;;
+  attn)         shift; exec "$(sibling attn)" "$@" ;;
+  "")           cmd_fzf ;;
+  *)            usage >&2; die "subcomando desconhecido: $1" ;;
 esac
