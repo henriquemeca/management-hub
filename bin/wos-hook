@@ -1,0 +1,31 @@
+#!/bin/zsh
+# wos-hook — telemetria própria do work-os (substitui os hooks do Orca).
+# Registrado nos hooks do Claude Code (dotfiles .claude/settings.json); recebe
+# o nome do evento como $1 e o payload JSON no stdin; appenda uma linha em
+# ~/.local/state/work-os/agents.jsonl:
+#   {ts, event, cwd, session_id, pid}
+# Derivação de estado (leitores): último evento por sessão —
+#   SessionStart/UserPromptSubmit → working · Stop → waiting ·
+#   PermissionRequest → blocked · liveness: kill -0 pid.
+# Nunca falha (exit 0 sempre) — telemetria não pode quebrar o agente.
+
+STORE="${WORK_OS_STATE:-$HOME/.local/state/work-os}/agents.jsonl"
+mkdir -p "${STORE:h}" 2>/dev/null
+
+EVENT="${1:-unknown}" STORE="$STORE" python3 -c '
+import json, os, sys, time
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    payload = {}
+line = {
+    "ts": int(time.time()),
+    "event": os.environ.get("EVENT", "unknown"),
+    "cwd": payload.get("cwd") or os.getcwd(),
+    "session_id": payload.get("session_id", ""),
+    "pid": os.getppid(),
+}
+with open(os.environ["STORE"], "a") as f:
+    f.write(json.dumps(line) + "\n")
+' 2>/dev/null
+exit 0

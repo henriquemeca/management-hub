@@ -1,0 +1,177 @@
+#!/bin/zsh
+# linear-gql — ponte direta com o Linear via GraphQL (substitui `orca linear`).
+#
+# Uso:
+#   linear-gql list --team HEN [--state Todo] [--limit 100]   issues abertas (JSON)
+#   linear-gql issue <KEY>                                    issue completa + comentários (JSON)
+#   linear-gql status-set <KEY> --to <StateName>              move estado
+#   linear-gql comment <KEY> --body-file -                    comenta (body via stdin)
+#   linear-gql create --team HEN --title T [--project NAME] [--state Backlog]
+#              [--priority 0-4] [--parent KEY] --body-file -  cria issue (JSON)
+#   linear-gql update-description <KEY> --body-file -         sobrescreve description
+#   linear-gql project-list [--query NOME]                    projetos do workspace (JSON)
+#
+# Auth: LINEAR_API_KEY no env ou em ~/.credentials.sh.
+# Cache de metadados (team/state ids): ~/.local/state/work-os/linear-meta.json
+# (apagável a qualquer momento — é derivado).
+
+set -o pipefail
+[[ -z "$LINEAR_API_KEY" && -f ~/.credentials.sh ]] && source ~/.credentials.sh
+[[ -n "$LINEAR_API_KEY" ]] || { print -u2 "linear-gql: LINEAR_API_KEY ausente"; exit 1 }
+
+exec python3 - "$@" <<'PY'
+import json, os, sys, urllib.request
+
+API = "https://api.linear.app/graphql"
+KEY = os.environ["LINEAR_API_KEY"]
+META = os.path.expanduser("~/.local/state/work-os/linear-meta.json")
+
+def gql(query, variables=None):
+    body = json.dumps({"query": query, "variables": variables or {}}).encode()
+    req = urllib.request.Request(API, data=body, headers={
+        "Authorization": KEY, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        out = json.load(r)
+    if out.get("errors"):
+        print(json.dumps(out["errors"]), file=sys.stderr)
+        sys.exit(1)
+    return out["data"]
+
+def die(msg):
+    print(f"linear-gql: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def load_meta():
+    try:
+        return json.load(open(META))
+    except Exception:
+        return {}
+
+def save_meta(m):
+    os.makedirs(os.path.dirname(META), exist_ok=True)
+    json.dump(m, open(META, "w"))
+
+def team_meta(team_key):
+    m = load_meta()
+    if team_key in m.get("teams", {}):
+        return m["teams"][team_key]
+    d = gql("""query($k:String!){ teams(filter:{key:{eq:$k}}){ nodes{
+        id key states{ nodes{ id name } } } } }""", {"k": team_key})
+    nodes = d["teams"]["nodes"]
+    if not nodes:
+        die(f"team {team_key} não encontrado")
+    t = nodes[0]
+    entry = {"id": t["id"], "states": {s["name"]: s["id"] for s in t["states"]["nodes"]}}
+    m.setdefault("teams", {})[team_key] = entry
+    save_meta(m)
+    return entry
+
+def issue_id(key):
+    d = gql("query($k:String!){ issue(id:$k){ id } }", {"k": key})
+    if not d.get("issue"):
+        die(f"issue {key} não encontrada")
+    return d["issue"]["id"]
+
+ISSUE_FIELDS = """identifier title description priority url
+    state{ name } team{ key } project{ name } parent{ identifier }
+    branchName updatedAt"""
+
+def arg(flag, default=None):
+    if flag in args:
+        i = args.index(flag)
+        return args[i + 1]
+    return default
+
+def body_from_file():
+    src = arg("--body-file")
+    if src is None:
+        die("--body-file obrigatório (use - para stdin)")
+    return sys.stdin.read() if src == "-" else open(src).read()
+
+args = sys.argv[1:]
+if not args:
+    die("subcomando obrigatório (list|issue|status-set|comment|create|update-description|project-list)")
+cmd, args = args[0], args[1:]
+
+if cmd == "list":
+    team = arg("--team", os.environ.get("WORK_LINEAR_TEAM", "HEN"))
+    state = arg("--state")
+    limit = int(arg("--limit", "100"))
+    filt = {"team": {"key": {"eq": team}}}
+    if state:
+        filt["state"] = {"name": {"eq": state}}
+    else:
+        filt["state"] = {"type": {"nin": ["completed", "canceled"]}}
+    d = gql("""query($f:IssueFilter,$n:Int){ issues(filter:$f, first:$n){
+        nodes{ """ + ISSUE_FIELDS + """ } } }""", {"f": filt, "n": limit})
+    print(json.dumps({"issues": d["issues"]["nodes"]}, ensure_ascii=False))
+
+elif cmd == "issue":
+    key = args[0]
+    d = gql("""query($k:String!){ issue(id:$k){ """ + ISSUE_FIELDS + """
+        comments(first:50){ nodes{ body createdAt } }
+        children(first:50){ nodes{ identifier state{ name } } } } }""", {"k": key})
+    print(json.dumps(d["issue"], ensure_ascii=False))
+
+elif cmd == "status-set":
+    key, to = args[0], arg("--to")
+    to or die("--to obrigatório")
+    team = key.rsplit("-", 1)[0]
+    tm = team_meta(team)
+    sid = tm["states"].get(to) or die(f"estado '{to}' não existe no team {team}")
+    gql("""mutation($i:String!,$s:String!){ issueUpdate(id:$i, input:{stateId:$s}){ success } }""",
+        {"i": issue_id(key), "s": sid})
+    print(f"✓ {key} → {to}")
+
+elif cmd == "comment":
+    key = args[0]
+    body = body_from_file()
+    gql("""mutation($i:String!,$b:String!){ commentCreate(input:{issueId:$i, body:$b}){ success } }""",
+        {"i": issue_id(key), "b": body})
+    print(f"✓ comentário em {key}")
+
+elif cmd == "update-description":
+    key = args[0]
+    body = body_from_file()
+    gql("""mutation($i:String!,$b:String!){ issueUpdate(id:$i, input:{description:$b}){ success } }""",
+        {"i": issue_id(key), "b": body})
+    print(f"✓ description de {key} atualizada")
+
+elif cmd == "create":
+    team = arg("--team", os.environ.get("WORK_LINEAR_TEAM", "HEN"))
+    title = arg("--title") or die("--title obrigatório")
+    tm = team_meta(team)
+    inp = {"teamId": tm["id"], "title": title, "description": body_from_file()}
+    state = arg("--state")
+    if state:
+        inp["stateId"] = tm["states"].get(state) or die(f"estado '{state}' inexistente")
+    prio = arg("--priority")
+    if prio is not None:
+        inp["priority"] = int(prio)
+    parent = arg("--parent")
+    if parent:
+        inp["parentId"] = issue_id(parent)
+    project = arg("--project")
+    if project:
+        d = gql("""query($q:String!){ projects(filter:{name:{eqIgnoreCase:$q}}, first:1){
+            nodes{ id name } } }""", {"q": project})
+        nodes = d["projects"]["nodes"]
+        if nodes:
+            inp["projectId"] = nodes[0]["id"]
+        else:
+            print(f"linear-gql: projeto '{project}' não existe — criando sem projeto",
+                  file=sys.stderr)
+    d = gql("""mutation($in:IssueCreateInput!){ issueCreate(input:$in){ success
+        issue{ identifier url title } } }""", {"in": inp})
+    print(json.dumps(d["issueCreate"]["issue"], ensure_ascii=False))
+
+elif cmd == "project-list":
+    q = arg("--query")
+    filt = {"name": {"containsIgnoreCase": q}} if q else None
+    d = gql("""query($f:ProjectFilter){ projects(filter:$f, first:50){
+        nodes{ id name } } }""", {"f": filt})
+    print(json.dumps({"projects": d["projects"]["nodes"]}, ensure_ascii=False))
+
+else:
+    die(f"subcomando desconhecido: {cmd}")
+PY

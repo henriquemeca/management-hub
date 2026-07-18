@@ -3,9 +3,9 @@
 #
 # Uso:
 #   wos                  interativo (fzf), em loop — a mesa única. enter age
-#                        por tipo: gate/msg responde inline (vazio = focar),
-#                        rodando foca o pane, ⇧ PR merged roda ship, fila
-#                        escolhe modelo/effort e spawna; no fim da lista,
+#                        por tipo: gate responde inline (vazio = focar),
+#                        rodando foca a janela tmux, ⇧ PR merged roda ship,
+#                        fila escolhe modelo/effort e spawna; no fim da lista,
 #                        ações: capturar / triage / sync. esc sai.
 #   wos ps [--tsv]       a mesma visão unificada em texto (--tsv = feed cru
 #                        `kind \t handle \t label`, proto-contrato do hub)
@@ -13,9 +13,8 @@
 #                  [--agent claude|…] [--dry-run]
 #                        disparo individual consciente. Sem flags → trailer
 #                        agent-config da issue, senão política default.
-#   wos peek <KEY> [n]   últimas n linhas (default 40) do terminal do agente —
-#                        a sessão do Orca lida do SEU terminal
-#   wos say <KEY> <txt…> envia texto (com Enter) ao terminal do agente
+#   wos peek <KEY> [n]   últimas n linhas (default 40) do pane tmux do agente
+#   wos say <KEY> <txt…> envia texto (com Enter) ao pane tmux do agente
 #   wos go <KEY>         no tmux: abre janela no diretório do worktree;
 #                        fora: imprime o caminho (cd "$(wos go HEN-42)")
 #   wos capture [...]    → work      (captura crua; alias: wos work)
@@ -34,8 +33,11 @@
 # Motor de spawn: linear-sync --only <KEY> com overrides via env
 # (LINEAR_SYNC_MODEL/LINEAR_SYNC_EFFORT/LINEAR_SYNC_AGENT) — resolução de
 # trailer, dedup e cap vivem lá; wos não duplica essa lógica.
-# Pendências: attn --tsv é a fonte (gates, msgs, agents esperando, órfãos);
+# Pendências: attn --tsv é a fonte (gates, agents esperando, órfãos);
 # wos não duplica essa coleta.
+# Rodando: janelas tmux `wm-<slug>` (workmux) + estado por sessão via
+# agents.jsonl (hooks do Claude Code, match cwd↔path do worktree) + PR via
+# `gh pr list` rodado no diretório do worktree — gh falhou = sem info de PR.
 # Fila: `linear-sync --queue --json` é a fonte (HEN-57) — a ordenação
 # (prioridade Linear urgent→low, sem prioridade por último, depois key) é
 # computada num único lugar; wos só rendera a saída.
@@ -44,6 +46,7 @@ set -o pipefail
 
 TEAM="${WORK_LINEAR_TEAM:-HEN}"
 CAP="${LINEAR_SYNC_CAP:-2}"
+AGENTS="${WORK_OS_STATE:-$HOME/.local/state/work-os}/agents.jsonl"
 
 # $0 de nível de script — dentro de função, zsh troca $0 pelo nome da função.
 SELF="$0"
@@ -68,60 +71,142 @@ sibling() {
 }
 
 # Emite TSV `kind \t handle \t label`:
-#   run:<KEY>    worktree ativo vinculado (handle = pane p/ focar)
+#   run:<KEY>    janela wm-<slug> viva (handle = janela tmux p/ focar)
+#   ship:<KEY>   agente waiting + PR merged → falta ship
 #   queue:<KEY>  issue em Todo, na ordem do linear-sync
 gather_rows() {
-  local ps_json queue_json terms_json linear_sync_bin
-  ps_json=$(orca worktree ps --json 2>&1)
-  print -r -- "$ps_json" | grep -q '"ok": *true' ||
-    die "runtime do Orca fora do ar? tente \`orca open\`"
-  linear_sync_bin=$(sibling linear-sync)
-  queue_json=$(WORK_LINEAR_TEAM="$TEAM" "$linear_sync_bin" --queue --json 2>/dev/null)
-  terms_json=$(orca terminal list --json 2>/dev/null)
+  local queue_json panes wt_info win slug wpath branch pr ls_bin
+  # fila via linear-sync --queue (HEN-57: ordenação num único lugar) —
+  # falha de rede/API degrada para fila vazia, com aviso
+  ls_bin=$(sibling linear-sync 2>/dev/null) || ls_bin=""
+  queue_json=""
+  if [[ -n "$ls_bin" ]]; then
+    queue_json=$(WORK_LINEAR_TEAM="$TEAM" "$ls_bin" --queue --json 2>/dev/null) || {
+      queue_json=""
+      print -u2 "wos: fila Todo indisponível (linear-sync --queue falhou — rede/API?)"
+    }
+  else
+    print -u2 "wos: linear-sync não encontrado — fila Todo indisponível"
+  fi
 
-  python3 - "$ps_json" "$queue_json" "$terms_json" <<'PY'
-import json, sys
+  panes=$(tmux list-panes -a -F $'#{window_name}\t#{pane_current_path}' 2>/dev/null)
 
-def load(raw):
+  # janelas wm-<slug> vivas → path do worktree, branch e PR (gh no diretório)
+  wt_info=""
+  for win in ${(f)"$(print -r -- "$panes" | cut -f1 | grep '^wm-' | sort -u)"}; do
+    slug="${win#wm-}"
+    local -a cand=( ~/worktrees/*/"$slug"(N/) )
+    wpath="${cand[1]:-}"
+    [[ -d "$wpath" ]] ||
+      wpath=$(print -r -- "$panes" | awk -F'\t' -v w="$win" '$1==w {print $2; exit}')
+    branch="" pr=""
+    if [[ -d "$wpath" ]]; then
+      branch=$(git -C "$wpath" rev-parse --abbrev-ref HEAD 2>/dev/null)
+      [[ -n "$branch" ]] && pr=$(cd "$wpath" 2>/dev/null &&
+        gh pr list --head "$branch" --state all --json number,state,mergedAt \
+          2>/dev/null | tr -d '\n')
+    fi
+    wt_info+="${slug}"$'\t'"${wpath}"$'\t'"${branch}"$'\t'"${pr}"$'\n'
+  done
+
+  AGENTS="$AGENTS" python3 - "$queue_json" "$wt_info" <<'PY'
+import json, os, re, sys
+
+queue_raw, wt_raw = sys.argv[1], sys.argv[2]
+
+# sessões do Claude Code (mesmo contrato do attn): último evento
+# não-SubagentStop por sessão; pid morto → ignorar.
+STATE = {"SessionStart": "working", "UserPromptSubmit": "working",
+         "Stop": "waiting", "PermissionRequest": "blocked"}
+
+def alive(pid):
     try:
-        d = json.loads(raw, strict=False)
-        return d.get("result", {}) if d.get("ok") else {}
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
     except Exception:
-        return {}
+        return False
 
-ps, queue, terms = (load(a) for a in sys.argv[1:4])
+sessions = {}
+try:
+    with open(os.environ["AGENTS"]) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("event") == "SubagentStop":
+                continue
+            sid = ev.get("session_id")
+            if sid:
+                sessions[sid] = ev
+except OSError:
+    pass
 
-by_worktree = {}
-for t in terms.get("terminals", []):
-    by_worktree.setdefault(t["worktreeId"], t["handle"])
+live = [ev for ev in sessions.values()
+        if ev.get("event") in STATE and alive(ev.get("pid"))]
 
-# rodando: worktrees ativos com issue vinculada (aceite 1)
-for w in ps.get("worktrees", []):
-    if w.get("isArchived") or not w.get("linkedLinearIssue"):
+def state_for_path(path):
+    """Estado da sessão cujo cwd está no worktree (raiz ou subdir — nunca o
+    contrário: sessão em diretório mais raso, ex. $HOME, não é deste worktree)."""
+    if not path:
+        return ""
+    p = path.rstrip("/")
+    best, best_ts = None, -1
+    for ev in live:
+        cwd = (ev.get("cwd") or "").rstrip("/")
+        if not cwd:
+            continue
+        if cwd == p or cwd.startswith(p + "/"):
+            ts = ev.get("ts") or 0
+            if ts > best_ts:
+                best, best_ts = ev, ts
+    return STATE[best["event"]] if best else ""
+
+# rodando: janelas wm-<slug> vivas (aceite 1)
+for line in wt_raw.splitlines():
+    parts = line.split("\t")
+    if len(parts) < 4:
         continue
-    key = w["linkedLinearIssue"]
-    states = [a.get("state") for a in w.get("agents", [])]
-    if "working" in states:
-        st = "working"
-    elif any(s in ("waiting", "interrupted") for s in states):
-        st = "waiting"
-    elif "done" in states:
-        st = "done"
-    else:
-        st = states[0] if states else "sem agente"
-    agents = ",".join(sorted({a.get("agentType", "?") for a in w.get("agents", [])})) or "-"
-    branch = (w.get("branch") or "").replace("refs/heads/", "")
-    pr = w.get("linkedPR") or {}
-    pr_s = f' · PR #{pr["number"]} ({pr.get("state", "?")})' if pr else ""
-    icon = {"working": "●", "waiting": "⏸", "done": "✔"}.get(st, "·")
-    handle = by_worktree.get(w.get("worktreeId", ""), "")
-    if st == "done" and str(pr.get("state", "")).lower() == "merged":
+    slug, path, branch = parts[0], parts[1], parts[2]
+    pr_raw = "\t".join(parts[3:])
+    m = re.search(r"([A-Za-z]+-\d+)", slug)
+    key = m.group(1).upper() if m else slug
+    st = state_for_path(path) or "sem sessão"
+    pr = {}
+    try:
+        arr = json.loads(pr_raw) if pr_raw else []
+        if isinstance(arr, list) and arr:
+            pr = arr[0]
+    except Exception:
+        pr = {}
+    pr_state = str(pr.get("state", "")).upper()
+    pr_s = f' · PR #{pr["number"]} ({pr_state})' if pr.get("number") else ""
+    handle = f"wm-{slug}"
+    if st == "waiting" and pr_state == "MERGED":
         print(f'ship:{key}\t{handle}\t⇧ {key} · PR #{pr["number"]} merged · falta ship (enter roda)')
     else:
-        print(f'run:{key}\t{handle}\t{icon} {key} · {st} · {agents} · {branch}{pr_s}')
+        icon = {"working": "●", "waiting": "⏸", "blocked": "⛔"}.get(st, "·")
+        print(f'run:{key}\t{handle}\t{icon} {key} · {st} · {branch or slug}{pr_s}')
 
 # fila: já ordenada por `linear-sync --queue --json` (HEN-57) — wos só rendera.
-for item in queue.get("queue", []):
+try:
+    queue = (json.loads(queue_raw).get("result") or {}).get("queue", []) if queue_raw else []
+except Exception:
+    queue = []
+for item in queue:
     key = item["key"]
     label = item.get("priorityLabel", "?")
     title = item.get("title", "")
@@ -137,39 +222,36 @@ gather_all() {
   attn_bin=$(sibling attn 2>/dev/null) || attn_bin=""
   pend=""
   [[ -n "$attn_bin" ]] && pend=$("$attn_bin" --tsv 2>/dev/null |
-    awk -F'\t' '$1 ~ /^(gate:|msg:|input$|orphan$)/')
+    awk -F'\t' '$1 ~ /^(gate:|input$|waiting$|orphan$)/')
   rows=$(gather_rows) || return 1
   [[ -n "$pend" ]] && print -r -- "$pend"
   [[ -n "$rows" ]] && print -r -- "$rows"
   return 0
 }
 
-# KEY → `handle \t path \t name` do worktree ativo vinculado (1º terminal vivo).
+# KEY → `handle \t path \t name` do worktree em ~/worktrees/<project>/<slug>
+# (slug contém a key); handle = janela tmux wm-<slug> se estiver viva.
 resolve_wt() {
-  local key="${(U)1}" wt_json terms_json
-  wt_json=$(orca worktree list --json 2>/dev/null)
-  terms_json=$(orca terminal list --json 2>/dev/null)
-  KEY="$key" python3 - "$wt_json" "$terms_json" <<'PY'
-import json, os, sys
-
-def load(raw):
-    try:
-        d = json.loads(raw, strict=False)
-        return d.get("result", {}) if d.get("ok") else {}
-    except Exception:
-        return {}
-
-wts, terms = (load(a) for a in sys.argv[1:3])
-key = os.environ["KEY"]
-by_wt = {}
-for t in terms.get("terminals", []):
-    by_wt.setdefault(t["worktreeId"], t["handle"])
-for w in wts.get("worktrees", []):
-    if w.get("isArchived") or w.get("linkedLinearIssue") != key:
-        continue
-    print(f'{by_wt.get(w.get("id", ""), "")}\t{w.get("path", "")}\t{w.get("displayName", "")}')
-    break
-PY
+  local key="${(L)1}" d slug win
+  local wins
+  wins=$(tmux list-windows -a -F '#{window_name}' 2>/dev/null)
+  local -a dirs=( ~/worktrees/*/*(N/) )
+  for d in "${dirs[@]}"; do
+    slug="${d:t}"
+    [[ "-${(L)slug}-" == *"-${key}-"* ]] || continue
+    win="wm-$slug"
+    print -r -- "$wins" | grep -qx -- "$win" || win=""
+    print -r -- "${win}"$'\t'"${d}"$'\t'"${slug}"
+    return 0
+  done
+  # sem diretório: uma janela viva ainda pode existir (worktree movido à mão)
+  for win in ${(f)"$(print -r -- "$wins" | grep '^wm-')"}; do
+    slug="${win#wm-}"
+    [[ "-${(L)slug}-" == *"-${key}-"* ]] || continue
+    print -r -- "${win}"$'\t'''$'\t'"${slug}"
+    return 0
+  done
+  return 1
 }
 
 require_wt() {
@@ -190,7 +272,7 @@ cmd_ps() {
     return
   fi
   local -a pend=( ${(f)"$(print -r -- "$rows" |
-    awk -F'\t' '$1 ~ /^(gate:|msg:|input$|orphan$)/')"} )
+    awk -F'\t' '$1 ~ /^(gate:|input$|waiting$|orphan$)/')"} )
   local -a run=( ${(f)"$(print -r -- "$rows" | grep -E '^(run|ship):')"} )
   local -a queue=( ${(f)"$(print -r -- "$rows" | grep '^queue:')"} )
   print "pendências (${#pend[@]}):"
@@ -203,7 +285,7 @@ cmd_ps() {
   if (( ${#run[@]} )); then
     for r in "${run[@]}"; do print -r -- "  ${r##*$'\t'}"; done
   else
-    print "  (nenhum worktree vinculado a issue)"
+    print "  (nenhuma janela wm-* viva)"
   fi
   print "fila Todo (${#queue[@]}, ordem do sync):"
   if (( ${#queue[@]} )); then
@@ -244,15 +326,16 @@ cmd_spawn() {
   env "${envv[@]}" "$(sibling linear-sync)" "${args[@]}"
 }
 
-# ---------- wos peek / say / go — a sessão do Orca no seu terminal ----------
+# ---------- wos peek / say / go — a sessão do agente no seu tmux ----------
 cmd_peek() {
   local key="$1" n="${2:-40}"
   [[ -n "$key" ]] || die "uso: wos peek <KEY> [linhas]"
   local row handle
   row=$(require_wt "$key") || exit 1
   handle="${row%%$'\t'*}"
-  [[ -n "$handle" ]] || die "worktree de ${(U)key} não tem terminal vivo"
-  orca terminal read --terminal "$handle" --limit "$n"
+  [[ -n "$handle" ]] || die "worktree de ${(U)key} não tem janela tmux viva"
+  tmux capture-pane -p -t "$handle" -S "-$n" 2>/dev/null | tail -n "$n" ||
+    die "falha ao capturar (janela morta?)"
 }
 
 cmd_say() {
@@ -262,10 +345,11 @@ cmd_say() {
   local row handle
   row=$(require_wt "$key") || exit 1
   handle="${row%%$'\t'*}"
-  [[ -n "$handle" ]] || die "worktree de ${(U)key} não tem terminal vivo"
-  orca terminal send --terminal "$handle" --text "$*" --enter --json >/dev/null 2>&1 &&
+  [[ -n "$handle" ]] || die "worktree de ${(U)key} não tem janela tmux viva"
+  tmux send-keys -t "$handle" -l -- "$*" 2>/dev/null &&
+    tmux send-keys -t "$handle" Enter 2>/dev/null &&
     print "→ enviado ao agente de ${(U)key}" ||
-    die "falha ao enviar (pane morto?)"
+    die "falha ao enviar (janela morta?)"
 }
 
 cmd_go() {
@@ -321,20 +405,20 @@ pick_and_spawn() {
 
 focus_pane() {
   local handle="$1" label="$2"
-  if [[ -n "$handle" ]] && orca terminal switch --terminal "$handle" --json >/dev/null 2>&1; then
-    print -r -- "→ focado no app Orca: $label"
+  if [[ -n "$handle" ]] && tmux select-window -t "$handle" 2>/dev/null; then
+    print -r -- "→ focado na janela tmux $handle: $label"
   else
-    print -u2 "wos: pane não encontrado"
+    print -u2 "wos: janela não encontrada"
     pause_panel
   fi
 }
 
-# gate/msg: responder inline direto do painel; resposta vazia = focar o pane.
+# gate: responder inline direto do painel; resposta vazia = focar a janela.
 answer_inline() {
   local kind="$1" handle="$2" label="$3"
   print -r -- "$label"
   local resp=""
-  read -r "resp?resposta (vazio = focar pane, esc+enter cancela)> "
+  read -r "resp?resposta (vazio = focar janela, esc+enter cancela)> "
   # esc+enter (ou sequência de seta) chega como \e literal no buffer — cancelar,
   # nunca resolver o gate com caractere de controle como resposta.
   [[ "$resp" == *$'\e'* ]] && { print "cancelado"; return }
@@ -344,14 +428,9 @@ answer_inline() {
   fi
   case "$kind" in
     gate:*)
-      orca orchestration gate-resolve --id "${kind#gate:}" --resolution "$resp" --json \
+      "$(sibling gates)" resolve --id "${kind#gate:}" --resolution "$resp" \
         >/dev/null 2>&1 && print "✓ gate resolvido (a resposta entra na próxima rodada da triagem)" ||
         print -u2 "wos: falha ao resolver o gate ${kind#gate:}"
-      ;;
-    msg:*)
-      orca orchestration reply --id "${kind#msg:}" --body "$resp" --json \
-        >/dev/null 2>&1 && print "✓ resposta enviada" ||
-        print -u2 "wos: falha ao responder a mensagem ${kind#msg:}"
       ;;
   esac
   pause_panel
@@ -375,7 +454,7 @@ cmd_fzf() {
 
     sel=$(print -r -- "$rows" |
       fzf --delimiter '\t' --with-nth 3 --no-multi \
-          --header "enter age por tipo · ⛔✉ responde/foca · ● foca · ⇧ ship · ○ spawna · esc sai" \
+          --header "enter age por tipo · ⛔ responde/foca · ●⏸💤 foca · ⇧ ship · ○ spawna · esc sai" \
           --prompt 'wos> ' --height=100% --layout=reverse)
     [[ -z "$sel" ]] && return
 
@@ -385,8 +464,8 @@ cmd_fzf() {
     label="${rest#*$'\t'}"
 
     case "$kind" in
-      gate:*|msg:*) answer_inline "$kind" "$handle" "$label" ;;
-      run:*|input|orphan) focus_pane "$handle" "$label" ;;
+      gate:*) answer_inline "$kind" "$handle" "$label" ;;
+      run:*|input|waiting|orphan) focus_pane "$handle" "$label" ;;
       ship:*)
         "$(sibling ship)" "${kind#ship:}"
         pause_panel

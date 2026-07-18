@@ -1,5 +1,5 @@
 #!/bin/zsh
-# linear-sync — loop de spawn Linear→Orca: issue em Todo → worktree + agente.
+# linear-sync — loop de spawn Linear→workmux: issue em Todo → worktree + agente.
 #
 # Uso:
 #   linear-sync              processa todas as issues Todo do team
@@ -11,28 +11,28 @@
 #                             consumido pelo wos, que não a reimplementa.
 #
 # Gate: só issues do team (WORK_LINEAR_TEAM, default HEN) em estado Todo.
-# Agente: LINEAR_SYNC_AGENT (default claude) — qualquer TUI agent que o Orca
-# conheça (`--agent` do worktree create; ex.: claude, pi, codex).
 # Fluxo de integração (decisão 2026-07-18): worktrees partem da branch longa
 # de integração LINEAR_SYNC_BASE (default dev); cada task vira UM commit
 # squash na dev (PR contra dev, merge imediato pelo agente). A revisão humana
 # é em lote: PR dev→main quando o Henrique quiser — main continua manual.
 # Repo alvo: trailer "repo: `<canonicalKey>`" no body da issue (criado pela
-# captura `work`); sem trailer, ou repo não registrado no Orca → pendência,
-# não spawna. Cap de paralelismo: LINEAR_SYNC_CAP (default 2) worktrees
-# ativos vinculados a issue; excedentes ficam em Todo (fila). Dedup por
-# issue-key via `orca worktree list` — rodar de novo não duplica worktree.
+# captura `work`); canonicalKey→path vem do registro
+# ~/.local/state/work-os/repos.json. Sem trailer, ou repo fora do registro →
+# pendência, não spawna. Cap de paralelismo: LINEAR_SYNC_CAP (default 2)
+# janelas tmux 'wm-*' ativas; excedentes ficam em Todo (fila). Dedup por
+# slug: worktree em ~/worktrees/<project>/<slug> OU janela tmux 'wm-<slug>'
+# viva → rodar de novo não duplica worktree.
 #
-# Modelo/effort (HEN-38, só p/ agente claude) — precedência da resolução:
+# Modelo/effort (HEN-38) — precedência da resolução:
 #   1. env LINEAR_SYNC_MODEL / LINEAR_SYNC_EFFORT (é assim que `wos spawn`
 #      passa as flags de CLI; override consciente vence tudo)
 #   2. trailer "agent-config: `model=<m> effort=<e>`" no body da issue
 #      (linha própria, última ocorrência vence — mesmo estilo do repo:)
 #   3. política default: sonnet/medium (rotina). Valores: model
 #      sonnet|opus|haiku, effort low|medium|high.
-# Mecanismo: worktree sem --agent + `claude --model <m> --effort <e>` enviado
-# ao terminal inicial (o launcher nativo do Orca não expõe modelo/effort).
-# Agente ≠ claude → caminho legado `worktree create --agent`, sem modelo/effort.
+# Mecanismo: perfis do workmux — (haiku,low)→cc-haiku-low,
+# (sonnet,medium)→cc-sonnet-medium, (sonnet,high)→cc-sonnet-high,
+# (opus,high)→cc-opus-high; combinação sem perfil → warn + cc-sonnet-medium.
 
 set -o pipefail
 
@@ -41,8 +41,9 @@ SELF="$0"
 
 TEAM="${WORK_LINEAR_TEAM:-HEN}"
 CAP="${LINEAR_SYNC_CAP:-2}"
-AGENT="${LINEAR_SYNC_AGENT:-claude}"
 BASE="${LINEAR_SYNC_BASE:-dev}"
+REPOS_JSON="$HOME/.local/state/work-os/repos.json"
+WORKTREES_ROOT="$HOME/worktrees"
 
 # Overrides de modelo/effort (vazio = sem override; resolução por issue).
 MODEL_OVERRIDE="${LINEAR_SYNC_MODEL:-}"
@@ -62,36 +63,38 @@ die() {
   exit 1
 }
 
-# Envelope JSON do orca com ok:true? (JSON pode ter control chars crus → strict=False)
-json_ok() {
-  RAW="$1" python3 - <<'PY'
-import json, os, sys
-try:
-    d = json.loads(os.environ["RAW"], strict=False)
-except Exception:
-    sys.exit(1)
-sys.exit(0 if d.get("ok") else 1)
-PY
+# Perfil workmux para (model, effort). Combinação fora da tabela → warn +
+# default cc-sonnet-medium (não bloqueia o spawn).
+profile_for() {
+  case "$1/$2" in
+    haiku/low)     print cc-haiku-low ;;
+    sonnet/medium) print cc-sonnet-medium ;;
+    sonnet/high)   print cc-sonnet-high ;;
+    opus/high)     print cc-opus-high ;;
+    *)
+      print -u2 "  ⚠ combinação $1/$2 sem perfil workmux — usando cc-sonnet-medium"
+      print cc-sonnet-medium
+      ;;
+  esac
 }
 
 # Prompt inicial do agente no worktree spawnado. Heredoc quotado: os backticks
-# são literais (não command substitution); a key entra via sed.
+# são literais (não command substitution); key e base entram via sed.
 agent_prompt() {
-  sed "s/__KEY__/$1/g" <<'EOF'
-Você é o agente de código deste worktree Orca, vinculado à issue Linear __KEY__.
+  sed -e "s/__KEY__/$1/g" -e "s/__BASE__/$BASE/g" <<'EOF'
+Você é o agente de código deste worktree, vinculado à issue Linear __KEY__.
 
 Contexto primeiro (nesta ordem):
-1. `orca linear issue --current --full --json` — sua issue; o aceite está na description; leia também comentários, anexos e relações.
+1. A spec acima traz a description da issue (o aceite está nela); comentários e sub-issues: `linear-gql issue __KEY__`.
 2. Suas instruções globais e do repo (CLAUDE.md/AGENTS.md) — siga a matriz de autonomia.
-3. `orca agent-context --json` — fonte de verdade do schema dos comandos `orca`; não decore flags.
 
 Contrato de trabalho:
-- Fluxo: commits na sua branch → PR contra a branch de integração `dev` (`gh pr create --base dev`) → você mesmo faz o merge squash (`gh pr merge --squash --delete-branch`). Cada task = UM commit na dev. NUNCA abra PR contra main — a revisão humana acontece em lote, no PR dev→main.
-- Conflito ao integrar na dev, ou dúvida de design: pergunte (gate), não force.
-- Evidência antes de integrar (saídas de testes no corpo do PR). Anexe o PR à issue: `orca linear attach --current --url <pr-url> --title "PR"`.
-- Integrou na dev → mova a issue: `orca linear status set --current --to Done`.
+- Fluxo: commits na sua branch → PR contra a branch de integração `__BASE__` (`gh pr create --base __BASE__`) → você mesmo faz o merge squash (`gh pr merge --squash --delete-branch`). Cada task = UM commit na __BASE__. NUNCA abra PR contra main — a revisão humana acontece em lote, no PR __BASE__→main.
+- Conflito ao integrar na __BASE__, ou dúvida de design: abra um gate (`gates create --task "__KEY__" --question "<pergunta>"`) e aguarde — não force.
+- Evidência antes de integrar (saídas de testes no corpo do PR). Anexe o PR à issue: `linear-gql comment __KEY__ --body-file -` com o link do PR.
+- Integrou na __BASE__ → NÃO mova a issue para Done nem rode `workmux merge`: o fechamento (status + limpeza do worktree) é do `ship`.
 - Corpos multiline no CLI sempre via `--body-file -`.
-- Ao fechar, deixe comentário `## Lessons` na issue (surpresas, o que o spec não cobriu).
+- Ao fechar, deixe comentário `## Lessons` na issue (surpresas, o que o spec não cobriu): `linear-gql comment __KEY__ --body-file -`.
 EOF
 }
 
@@ -124,8 +127,30 @@ done
 [[ -z "$EFFORT_OVERRIDE" || ${VALID_EFFORTS[(Ie)$EFFORT_OVERRIDE]} -gt 0 ]] ||
   die "LINEAR_SYNC_EFFORT inválido: $EFFORT_OVERRIDE (use: $VALID_EFFORTS)"
 
-issues_raw=$(orca linear list --filter open --team "$TEAM" --limit 100 --json 2>&1)
-json_ok "$issues_raw" || die "falha em \`orca linear list\`"
+# ---------- estado atual: repos, janelas wm-*, issues ----------
+[[ -f "$REPOS_JSON" ]] || die "registro de repos ausente: $REPOS_JSON — capture repos com \`work\` primeiro"
+repo_lines=$(REPOS_JSON="$REPOS_JSON" python3 - <<'PY'
+import json, os, sys
+try:
+    d = json.load(open(os.environ["REPOS_JSON"]))
+except Exception as e:
+    print(f"registro de repos ilegível: {e}", file=sys.stderr)
+    sys.exit(1)
+for key, path in d.items():
+    print(key + "\t" + path)
+PY
+) || die "falha ao ler $REPOS_JSON"
+typeset -A repo_path_of
+for line in ${(f)repo_lines}; do
+  repo_path_of[${line%%$'\t'*}]="${line#*$'\t'}"
+done
+
+# Janelas tmux de agentes: nome 'wm-<slug>'. Contagem = cap; nome = dedup.
+typeset -a wm_windows=( ${(f)"$(tmux list-windows -a -F '#{window_name}' 2>/dev/null | grep '^wm-')"} )
+running=${#wm_windows[@]}
+
+issues_raw=$(linear-gql list --team "$TEAM" --state Todo --limit 100) ||
+  die "falha em \`linear-gql list\` — rede/API do Linear fora do ar?"
 
 # ---------- --queue --json: só computa e emite a fila, sem mutar nada ----------
 # Contrato único da ordenação (aceite HEN-57): prioridade Linear urgent→low,
@@ -137,7 +162,7 @@ import json, os
 d = json.loads(os.environ["RAW"], strict=False)
 team = os.environ["TEAM"]
 todo = []
-for i in d.get("result", {}).get("issues", []):
+for i in d.get("issues", []):
     if (i.get("state") or {}).get("name") != "Todo":
         continue
     if (i.get("team") or {}).get("key") != team:
@@ -158,118 +183,88 @@ PY
   exit 0
 fi
 
-# ---------- estado atual: repos, worktrees, issues ----------
-repos_raw=$(orca repo list --json 2>&1)
-json_ok "$repos_raw" || die "falha em \`orca repo list\` — runtime do Orca fora do ar? tente \`orca open\`"
+# Diretório de trabalho por rodada: descriptions + specs de spawn.
+spec_dir=$(mktemp -d "${TMPDIR:-/tmp}/linear-sync.XXXXXX") || die "mktemp falhou"
 
-repo_lines=$(RAW="$repos_raw" python3 - <<'PY'
-import json, os
-d = json.loads(os.environ["RAW"], strict=False)
-for r in d.get("result", {}).get("repos", []):
-    key = (r.get("gitRemoteIdentity") or {}).get("canonicalKey")
-    if key:
-        print(key + "\t" + r["id"])
-PY
-)
-typeset -A repo_id
-for line in ${(f)repo_lines}; do
-  repo_id[${line%%$'\t'*}]="${line#*$'\t'}"
-done
-
-wt_raw=$(orca worktree list --json 2>&1)
-json_ok "$wt_raw" || die "falha em \`orca worktree list\`"
-
-linked_lines=$(RAW="$wt_raw" python3 - <<'PY'
-import json, os
-d = json.loads(os.environ["RAW"], strict=False)
-for w in d.get("result", {}).get("worktrees", []):
-    if w.get("isArchived"):
-        continue
-    key = w.get("linkedLinearIssue")
-    if key:
-        print(key)
-PY
-)
-typeset -a linked=( ${(f)linked_lines} )
-running=${#linked[@]}
-
-# Candidatas: estado Todo no team. Fila ordenada por prioridade Linear
-# (urgent→low, sem prioridade por último), depois por key (FIFO aproximado).
-todo_lines=$(RAW="$issues_raw" TEAM="$TEAM" python3 - <<'PY'
-import json, os
-d = json.loads(os.environ["RAW"], strict=False)
+# Candidatas: estado Todo no team (o filtro é server-side; revalidado aqui).
+# Fila ordenada por prioridade Linear (urgent=1→low=4, prioridade 0/ausente
+# por último), depois por número da key (FIFO aproximado). Por issue, uma
+# linha TSV: key, slug (branchName após a última '/', fallback identifier
+# minúsculo), repo canonicalKey do trailer (ou "-"), model e effort do
+# trailer agent-config (ou "-"). Trailers = linha própria; última ocorrência
+# vence (o body pode citar o formato como exemplo — bug HEN-37). A
+# description completa vai para $spec_dir/<key>.desc.
+todo_lines=$(RAW="$issues_raw" TEAM="$TEAM" SPEC_DIR="$spec_dir" python3 - <<'PY'
+import json, os, re, sys
+try:
+    d = json.loads(os.environ["RAW"], strict=False)
+except Exception:
+    print("resposta do linear-gql não é JSON", file=sys.stderr)
+    sys.exit(1)
 team = os.environ["TEAM"]
+spec_dir = os.environ["SPEC_DIR"]
 todo = []
-for i in d.get("result", {}).get("issues", []):
+for i in d.get("issues", []):
     if (i.get("state") or {}).get("name") != "Todo":
         continue
     if (i.get("team") or {}).get("key") != team:
         continue
+    key = i["identifier"]
+    desc = i.get("description") or ""
+    ms = re.findall(r"(?m)^repo: `([^`]+)`\s*$", desc)
+    repo = ms[-1] if ms else "-"
+    branch = i.get("branchName") or ""
+    slug = branch.rsplit("/", 1)[-1] if branch else key.lower()
+    cfgs = re.findall(r"(?m)^agent-config: `([^`]+)`\s*$", desc)
+    cfg = cfgs[-1] if cfgs else ""
+    mo = re.search(r"\bmodel=([a-z-]+)", cfg)
+    ef = re.search(r"\beffort=([a-z-]+)", cfg)
     p = i.get("priority") or 0
     try:
-        num = int(i["identifier"].rsplit("-", 1)[-1])
+        num = int(key.rsplit("-", 1)[-1])
     except ValueError:
         num = 10**9
-    todo.append((0 if p else 1, p, num, i["identifier"]))
-for _, _, _, key in sorted(todo):
-    print(key)
+    with open(os.path.join(spec_dir, key + ".desc"), "w") as f:
+        f.write(desc)
+    todo.append((0 if p else 1, p, num,
+                 "\t".join([key, slug, repo,
+                            mo.group(1) if mo else "-",
+                            ef.group(1) if ef else "-"])))
+for t in sorted(todo):
+    print(t[-1])
 PY
-)
+) || die "falha ao parsear a fila do Linear"
 typeset -a todo=( ${(f)todo_lines} )
 
 override_note=""
 [[ -n "$MODEL_OVERRIDE" || -n "$EFFORT_OVERRIDE" ]] &&
   override_note=" · override ${MODEL_OVERRIDE:-·}/${EFFORT_OVERRIDE:-·}"
-print "linear-sync · team $TEAM · agente $AGENT$override_note · base $BASE · cap $CAP · worktrees ativos vinculados: $running · em Todo: ${#todo[@]}"
+print "linear-sync · team $TEAM$override_note · base $BASE · cap $CAP · janelas wm-* ativas: $running · em Todo: ${#todo[@]}"
 (( dry_run )) && print "(dry-run: nada será criado nem mutado)"
 
 # ---------- loop por issue ----------
 typeset -a spawned queued pendencias deduped
 matched_only=0
 
-for key in "${todo[@]}"; do
+for line in "${todo[@]}"; do
+  IFS=$'\t' read -r key slug repo_key t_model t_effort <<< "$line"
   [[ -n "$only" && "$key" != "$only" ]] && continue
   matched_only=1
 
-  if (( ${linked[(Ie)$key]} )); then
-    print "= $key · dedup: já vinculada a worktree ativo — nada a fazer"
+  # Dedup: janela tmux viva OU worktree no disco → issue já tem agente/worktree.
+  if (( ${wm_windows[(Ie)wm-$slug]} )); then
+    print "= $key · dedup: janela tmux 'wm-$slug' viva — nada a fazer"
     deduped+=("$key")
     continue
   fi
-
-  issue_raw=$(orca linear issue "$key" --json 2>&1)
-  if ! json_ok "$issue_raw"; then
-    print "! $key · pendência: falha ao ler a issue"
-    pendencias+=("$key")
+  # {project} do workmux = basename do DIRETÓRIO do repo (ex.: .dotfiles),
+  # não o segmento do canonicalKey (dotfiles) — derivar do path registrado.
+  proj_dir="${repo_path_of[$repo_key]:t}"
+  if [[ "$repo_key" != "-" && -n "$proj_dir" && -d "$WORKTREES_ROOT/$proj_dir/$slug" ]]; then
+    print "= $key · dedup: worktree $WORKTREES_ROOT/$proj_dir/$slug existe — nada a fazer"
+    deduped+=("$key")
     continue
   fi
-
-  # linha 1: canonicalKey do trailer (ou "-"); linha 2: nome do worktree
-  # (slug do branchName sugerido pelo Linear, sem o prefixo de usuário);
-  # linhas 3 e 4: model/effort do trailer agent-config (ou "-").
-  info=$(RAW="$issue_raw" python3 - <<'PY'
-import json, os, re
-d = json.loads(os.environ["RAW"], strict=False)
-issue = d["result"]["issue"]
-desc = issue.get("description") or ""
-# Trailers = linha própria; última ocorrência vence (o body pode citar o
-# formato como exemplo no meio do texto — ex.: specs de tooling do Work OS).
-ms = re.findall(r"(?m)^repo: `([^`]+)`\s*$", desc)
-print(ms[-1] if ms else "-")
-branch = issue.get("branchName") or ""
-print(branch.rsplit("/", 1)[-1] if branch else issue["identifier"].lower())
-cfgs = re.findall(r"(?m)^agent-config: `([^`]+)`\s*$", desc)
-cfg = cfgs[-1] if cfgs else ""
-for field in ("model", "effort"):
-    m = re.search(r"\b%s=([a-z-]+)" % field, cfg)
-    print(m.group(1) if m else "-")
-PY
-)
-  info_lines=( ${(f)info} )
-  repo_key="${info_lines[1]}"
-  wt_name="${info_lines[2]}"
-  t_model="${info_lines[3]}"
-  t_effort="${info_lines[4]}"
 
   # Resolução modelo/effort: env (wos spawn) > trailer válido > default.
   # Trailer inválido não bloqueia o spawn: avisa e cai no default.
@@ -285,14 +280,21 @@ PY
   fi
   model="${MODEL_OVERRIDE:-${t_model:-$DEFAULT_MODEL}}"
   effort="${EFFORT_OVERRIDE:-${t_effort:-$DEFAULT_EFFORT}}"
+  profile=$(profile_for "$model" "$effort")
 
   if [[ "$repo_key" == "-" ]]; then
     print "! $key · pendência: sem trailer 'repo: \`…\`' no body — capture com \`work\` dentro do repo, ou adicione o trailer"
     pendencias+=("$key")
     continue
   fi
-  if [[ -z "${repo_id[$repo_key]}" ]]; then
-    print "! $key · pendência: repo $repo_key não registrado no Orca (rode \`orca repo add\`)"
+  repo_path="${repo_path_of[$repo_key]}"
+  if [[ -z "$repo_path" ]]; then
+    print "! $key · pendência: repo $repo_key fora do registro $REPOS_JSON"
+    pendencias+=("$key")
+    continue
+  fi
+  if [[ ! -d "$repo_path" ]]; then
+    print "! $key · pendência: path registrado de $repo_key não existe: $repo_path"
     pendencias+=("$key")
     continue
   fi
@@ -303,90 +305,40 @@ PY
     continue
   fi
 
-  agent_desc="$AGENT"
-  [[ "$AGENT" == claude ]] && agent_desc="claude $model/$effort"
-
   if (( dry_run )); then
-    print "→ $key · [dry-run] spawnaria worktree '$wt_name' em $repo_key + $agent_desc, e moveria p/ In Progress"
+    print "→ $key · [dry-run] spawnaria worktree '$slug' em $repo_key (base $BASE, perfil $profile), e moveria p/ In Progress"
     spawned+=("$key")
     (( running++ ))
     continue
   fi
 
-  if [[ "$AGENT" == claude ]]; then
-    # Claude com modelo/effort: o launcher nativo do Orca não expõe as flags,
-    # então o worktree nasce sem agente e o claude entra pelo terminal inicial.
-    create_raw=$(orca worktree create --repo "id:${repo_id[$repo_key]}" --name "$wt_name" \
-      --base-branch "$BASE" \
-      --linear-issue "$key" --no-parent --json 2>&1)
-    if ! json_ok "$create_raw"; then
-      print "✗ $key · falha no \`orca worktree create\`:"
-      print -r -- "$create_raw" | head -5
-      pendencias+=("$key")
-      continue
-    fi
-    wt_path=$(RAW="$create_raw" python3 - <<'PY'
-import json, os
-d = json.loads(os.environ["RAW"], strict=False)
-w = d.get("result", {}).get("worktree", d.get("result", {}))
-print(w.get("path", ""))
-PY
-)
-    # O terminal inicial do worktree nasce assíncrono — poll curto.
-    handle=""
-    for _ in {1..15}; do
-      handle=$(RAW="$(orca terminal list --worktree "path:$wt_path" --json 2>/dev/null)" python3 - <<'PY' 2>/dev/null
-import json, os
-d = json.loads(os.environ["RAW"], strict=False)
-ts = d.get("result", {}).get("terminals", []) if d.get("ok") else []
-print(ts[0]["handle"] if ts else "")
-PY
-)
-      [[ -n "$handle" ]] && break
-      sleep 1
-    done
+  # Spec de spawn: description completa da issue + contrato do agente.
+  spec_file="$spec_dir/${key}.md"
+  {
+    print "# $key — spec"
+    print ""
+    cat "$spec_dir/${key}.desc"
+    print ""
+    print "---"
+    print ""
+    agent_prompt "$key"
+  } > "$spec_file"
 
-    prompt="$(agent_prompt "$key")"
-    claude_cmd="claude --dangerously-skip-permissions --model $model --effort $effort ${(qq)prompt}"
-    launched=0
-    send_raw=""
-    if [[ -n "$handle" ]]; then
-      send_raw=$(orca terminal send --terminal "$handle" --text "$claude_cmd" --enter --json 2>&1)
-      json_ok "$send_raw" && launched=1
-    fi
-    if (( ! launched )); then
-      # fallback: pane nova já com o comando (fica um shell ocioso na primeira)
-      send_raw=$(orca terminal create --worktree "path:$wt_path" --command "$claude_cmd" --json 2>&1)
-      json_ok "$send_raw" && launched=1
-    fi
-    if (( ! launched )); then
-      print "✗ $key · worktree '$wt_name' criado e vinculado, mas o claude não subiu no terminal:"
-      print -r -- "$send_raw" | head -3
-      print "  → rode no pane do worktree: $claude_cmd"
-      pendencias+=("$key")
-      (( running++ ))
-      continue
-    fi
-  else
-    # Caminho legado (agentes ≠ claude): launcher nativo, sem modelo/effort.
-    create_raw=$(orca worktree create --repo "id:${repo_id[$repo_key]}" --name "$wt_name" \
-      --base-branch "$BASE" \
-      --linear-issue "$key" --agent "$AGENT" --prompt "$(agent_prompt "$key")" --no-parent --json 2>&1)
-    if ! json_ok "$create_raw"; then
-      print "✗ $key · falha no \`orca worktree create\`:"
-      print -r -- "$create_raw" | head -5
-      pendencias+=("$key")
-      continue
-    fi
+  add_out=$( (cd "$repo_path" && workmux add "$slug" --base "$BASE" -a "$profile" --prompt-file "$spec_file" -b) 2>&1 )
+  if (( $? != 0 )); then
+    print "✗ $key · falha no \`workmux add $slug\` em $repo_path:"
+    print -r -- "$add_out" | head -5
+    pendencias+=("$key")
+    continue
   fi
 
-  st_raw=$(orca linear status set "$key" --to "In Progress" --json 2>&1)
-  if json_ok "$st_raw"; then
-    print "✓ $key → worktree '$wt_name' ($repo_key) · $agent_desc rodando · In Progress"
+  if linear-gql status-set "$key" --to "In Progress" >/dev/null 2>&1; then
+    print "✓ $key → worktree '$slug' ($repo_key) · perfil $profile rodando · In Progress"
   else
-    print "✓ $key → worktree '$wt_name' ($repo_key) · $agent_desc rodando · ⚠ falha ao mover p/ In Progress — mova manualmente"
+    print "✓ $key → worktree '$slug' ($repo_key) · perfil $profile rodando · ⚠ falha ao mover p/ In Progress — mova manualmente"
   fi
   spawned+=("$key")
+  wm_windows+=("wm-$slug")
   (( running++ ))
 done
 

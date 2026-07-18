@@ -1,18 +1,17 @@
 #!/bin/zsh
-# attn — painel de atenção: agrega pendências que exigem o humano e leva ao pane certo.
+# attn — painel de atenção: agrega pendências que exigem o humano e leva à janela certa.
 #
 # Uso:
-#   attn             interativo (fzf) → selecionar foca o tab no app Orca
+#   attn             interativo (fzf) → selecionar foca a janela tmux
 #   attn --list      só lista as pendências (sem fzf), para scripts/testes
 #   attn --tsv       lista crua `tipo<TAB>handle<TAB>label`, para integrações
 #   attn --popup     interativo + pausa final (popup tmux)
 #
-# Fontes agregadas (app Orca, não tmux — ver discovery no HEN-13):
-#   gates pendentes    orca orchestration gate-list   (aprovação, design, permissão, custo)
-#   mensagens          orca orchestration inbox       (perguntas de workers/refinamento)
-#   agents esperando   orca worktree ps               (waiting/interrupted → pane exato)
-#   worktrees órfãos   orca worktree ps               (sem issue vinculada)
-# Sem pendências → resumo das sessões por worktree.
+# Fontes agregadas (local-first, sem Orca):
+#   gates pendentes    gates list --status pending --json   (fila local de decisões)
+#   agents esperando   agents.jsonl (hooks do Claude Code) × liveness (kill -0)
+#   worktrees órfãos   ~/worktrees/*/* sem janela tmux `wm-<slug>` (workmux)
+# Sem pendências → resumo das sessões vivas (agents.jsonl + janelas wm-*).
 
 set -o pipefail
 
@@ -21,6 +20,8 @@ SELF="$0"
 usage() {
   sed -n '2,8p' "$SELF" | sed 's/^# \{0,1\}//'
 }
+
+AGENTS="${WORK_OS_STATE:-$HOME/.local/state/work-os}/agents.jsonl"
 
 mode=fzf
 popup=0
@@ -33,93 +34,162 @@ esac
 
 pause() { (( popup )) && { print -n "qualquer tecla fecha…"; read -k 1 -s; } }
 
-ps_json=$(orca worktree ps --json 2>&1)
-if [[ $? -ne 0 ]] || ! print -r -- "$ps_json" | grep -q '"ok": *true'; then
-  print -u2 "attn: runtime do Orca fora do ar? tente \`orca open\`"
-  pause
-  exit 1
+# Irmãos moram ao lado do attn (bin/ do repo) ou no PATH.
+sibling() {
+  local s="${SELF:A:h}/$1"
+  [[ -x "$s" ]] && { print -r -- "$s"; return }
+  command -v "$1"
+}
+
+# Degradação: cada fonte que falhar vira vazio — nunca aborta o painel inteiro.
+gates_bin=$(sibling gates) || gates_bin=""
+gates_json=""
+if [[ -n "$gates_bin" ]]; then
+  gates_json=$("$gates_bin" list --status pending --json 2>/dev/null) || {
+    gates_json=""
+    print -u2 "attn: gates indisponível — seguindo sem gates"
+  }
 fi
-gates_json=$(orca orchestration gate-list --status pending --json 2>/dev/null)
-inbox_json=$(orca orchestration inbox --json 2>/dev/null)
-terms_json=$(orca terminal list --json 2>/dev/null)
-tasks_json=$(orca orchestration task-list --json 2>/dev/null)
+panes=$(tmux list-panes -a -F $'#{window_name}\t#{pane_current_path}' 2>/dev/null)
 
 # Junta as fontes e emite TSV: tipo \t handle \t label
-# (handle vazio = pendência sem pane; selecionar mostra a ação em vez de focar)
-rows=$(python3 - "$ps_json" "$gates_json" "$inbox_json" "$terms_json" "$tasks_json" <<'PY'
-import json, sys
+# (handle = nome de janela tmux; vazio = pendência sem janela — selecionar
+# mostra a ação em vez de focar)
+rows=$(ATTN_AGENTS="$AGENTS" python3 - "$gates_json" "$panes" <<'PY'
+import glob, json, os, re, sys, time
 
-def load(raw):
+gates_raw, panes_raw = sys.argv[1], sys.argv[2]
+
+try:
+    gates = json.loads(gates_raw).get("gates", []) if gates_raw else []
+except Exception:
+    gates = []
+
+panes = []                      # (janela, cwd do pane)
+for line in panes_raw.splitlines():
+    if "\t" in line:
+        w, p = line.split("\t", 1)
+        panes.append((w, p))
+windows = {w for w, _ in panes}
+wm_windows = {w for w in windows if w.startswith("wm-")}
+
+def window_for_path(cwd):
+    """Janela cujo pane casa com o cwd da sessão (match por prefixo de path)."""
+    if not cwd:
+        return ""
+    c = cwd.rstrip("/")
+    best, best_len = "", -1
+    for w, p in panes:
+        p = p.rstrip("/")
+        if p == c or p.startswith(c + "/") or c.startswith(p + "/"):
+            if len(p) > best_len:
+                best, best_len = w, len(p)
+    return best
+
+def window_for_key(key):
+    """Janela wm-<slug> do worktree de uma issue KEY (slug contém a key)."""
+    k = key.lower()
+    for w in sorted(wm_windows):
+        if f"-{k}-" in f"-{w[3:]}-":
+            return w
+    return ""
+
+# Sessões do Claude Code: último evento não-SubagentStop por sessão decide o
+# estado; pid morto → sessão encerrada, ignorar.
+STATE = {"SessionStart": "working", "UserPromptSubmit": "working",
+         "Stop": "waiting", "PermissionRequest": "blocked"}
+
+def alive(pid):
     try:
-        d = json.loads(raw, strict=False)
-        return d.get("result", {}) if d.get("ok") else {}
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
     except Exception:
-        return {}
+        return False
 
-ps, gates, inbox, terms, tasks = (load(a) for a in sys.argv[1:6])
+sessions = {}
+try:
+    with open(os.environ["ATTN_AGENTS"]) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("event") == "SubagentStop":
+                continue
+            sid = ev.get("session_id")
+            if sid:
+                sessions[sid] = ev  # log append-only cronológico: último vence
+except OSError:
+    pass
 
-terminals = terms.get("terminals", [])
-by_pane = {f'{t["tabId"]}:{t["leafId"]}': t["handle"] for t in terminals}
-by_worktree = {}
-for t in terminals:
-    by_worktree.setdefault(t["worktreeId"], t["handle"])
-task_terminal = {t["id"]: t.get("created_by_terminal_handle") or ""
-                 for t in tasks.get("tasks", [])}
-
-def issue_of(w):
-    return w.get("linkedLinearIssue") or w.get("linkedIssue") or ""
+live = [ev for ev in sessions.values()
+        if ev.get("event") in STATE and alive(ev.get("pid"))]
 
 def emit(kind, handle, label):
     print(f'{kind}\t{handle}\t{label}')
 
-worktrees = ps.get("worktrees", [])
 pend = 0
+now = time.time()
 
-# handles antigos de gates/msgs seguem válidos para `switch` (o list só emite
-# aliases novos); se o pane tiver morrido, o switch falha e o attn avisa.
-for g in gates.get("gates", []):
+for g in gates:
+    task = g.get("task") or ""
     q = (g.get("question") or "?").replace("\n", " ")[:100]
-    handle = task_terminal.get(g.get("task_id", ""), "")
-    emit(f'gate:{g.get("id", "")}', handle, f'⛔ gate · {q}')
+    m = re.search(r"\b([A-Za-z]+-\d+)\b", task)
+    handle = window_for_key(m.group(1)) if m else ""
+    emit(f'gate:{g.get("id", "")}', handle, f'⛔ gate · [{task}] {q}')
     pend += 1
 
-for m in inbox.get("messages", []):
-    if m.get("read"):
-        continue
-    subj = (m.get("subject") or "?").replace("\n", " ")[:80]
-    emit(f'msg:{m.get("id", "")}', m.get("from_handle") or "", f'✉ msg · {subj}')
-    pend += 1
-
-for w in worktrees:
-    name = w.get("displayName", "?")
-    issue = issue_of(w)
-    tag = f' · {issue}' if issue else ""
-    for a in w.get("agents", []):
-        state = a.get("state")
-        if state not in ("waiting", "interrupted") and not a.get("interrupted"):
-            continue
-        tool = a.get("toolName") or state
-        handle = by_pane.get(a.get("paneKey", ""), "")
-        emit("input", handle,
-             f'⏸ input · {name}{tag} · {a.get("agentType", "?")} esperando ({tool})')
+for ev in sorted(live, key=lambda e: e.get("ts") or 0):
+    st = STATE[ev["event"]]
+    cwd = ev.get("cwd") or ""
+    name = os.path.basename(cwd.rstrip("/")) or cwd or "?"
+    handle = window_for_path(cwd)
+    age = max(0, now - (ev.get("ts") or now))
+    h, mins = int(age // 3600), int(age % 3600 // 60)
+    ago = f"{h}h{mins:02d}" if h else f"{mins}min"
+    if st == "blocked":
+        emit("input", handle, f'⏸ input · {name} · sessão pediu permissão (há {ago})')
         pend += 1
-    if not w.get("isMainWorktree") and not issue and not w.get("linkedPR") \
-            and not w.get("isArchived"):
-        emit("orphan", by_worktree.get(w.get("worktreeId", ""), ""),
-             f'⚠ órfão · {name} sem issue vinculada ({w.get("branch", "")})')
+    elif st == "waiting" and age < 86400:
+        emit("waiting", handle, f'💤 waiting · {name} · agente parado há {ago}')
+        pend += 1
+
+wt_root = os.path.expanduser("~/worktrees")
+for d in sorted(glob.glob(os.path.join(wt_root, "*", "*"))):
+    if not os.path.isdir(d):
+        continue
+    slug = os.path.basename(d)
+    if f"wm-{slug}" not in windows:
+        proj = os.path.basename(os.path.dirname(d))
+        emit("orphan", "", f'⚠ órfão · {proj}/{slug} sem janela wm-{slug}')
         pend += 1
 
 if pend == 0:
-    # aceite 3: sem pendências → resumo das sessões
-    for w in worktrees:
-        issue = issue_of(w)
-        tag = f' · {issue}' if issue else ""
-        agents = ", ".join(
-            f'{a.get("agentType", "?")}:{a.get("state", "?")}' for a in w.get("agents", [])
-        ) or "sem agents"
-        handle = by_worktree.get(w.get("worktreeId", ""), "")
-        emit("summary", handle,
-             f'● {w.get("displayName", "?")}{tag} — {w.get("status", "idle")} · {agents}')
+    # aceite: sem pendências → resumo das sessões vivas
+    seen = set()
+    for ev in sorted(live, key=lambda e: e.get("ts") or 0):
+        st = STATE[ev["event"]]
+        cwd = ev.get("cwd") or ""
+        name = os.path.basename(cwd.rstrip("/")) or "?"
+        handle = window_for_path(cwd)
+        if handle:
+            seen.add(handle)
+        emit("summary", handle, f'● {name} — {st} · pid {ev.get("pid", "?")}')
+    for w in sorted(wm_windows - seen):
+        emit("summary", w, f'● {w} — janela viva, sem sessão registrada')
 PY
 )
 
@@ -137,9 +207,9 @@ elif [[ "$mode" == tsv ]]; then
   exit 0
 fi
 
-header="pendências → enter foca o pane no app Orca"
+header="pendências → enter foca a janela tmux"
 print -r -- "$rows" | head -1 | grep -q '^summary' &&
-  header="sem pendências — sessões ativas (enter foca)"
+  header="sem pendências — sessões vivas (enter foca)"
 
 sel=$(print -r -- "$rows" |
   fzf --delimiter '\t' --with-nth 3 --no-multi --header "$header" \
@@ -151,15 +221,14 @@ rest="${sel#*$'\t'}"
 handle="${rest%%$'\t'*}"
 label="${rest#*$'\t'}"
 
-if [[ -n "$handle" ]] && orca terminal switch --terminal "$handle" --json >/dev/null 2>&1; then
-  print "→ focado no app Orca: $label"
+if [[ -n "$handle" ]] && tmux select-window -t "$handle" 2>/dev/null; then
+  print "→ focado na janela tmux $handle: $label"
 else
-  [[ -n "$handle" ]] && print -u2 "attn: pane não encontrado ($handle)"
+  [[ -n "$handle" ]] && print -u2 "attn: janela não encontrada ($handle)"
   print -r -- "$label"
   case "$kind" in
-    gate:*) print "resolver: orca orchestration gate-resolve --id ${kind#gate:} --resolution '<texto>'" ;;
-    msg:*)  print "responder: orca orchestration reply --id ${kind#msg:} --body '<texto>'" ;;
-    *)      print "(pendência sem pane associado)" ;;
+    gate:*) print "resolver: gates resolve --id ${kind#gate:} --resolution '<texto>'" ;;
+    *)      print "(pendência sem janela associada)" ;;
   esac
   pause
 fi

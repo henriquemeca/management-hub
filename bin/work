@@ -6,21 +6,27 @@
 #   work                             modo interativo (prompt de título/descrição)
 #   work --popup                     interativo + pausa final (popup tmux)
 #   work --project <nome>            força o projeto Linear (pula a inferência)
+#   work --drain                     re-tenta capturas guardadas offline
 #
 # Vínculo repo→issue (repo-mapping consumido pelo loop de spawn, HEN-14):
 # executado dentro de um repo git, o body ganha a linha `repo: <host/owner/repo>`
-# — mesmo formato do canonicalKey de `orca repo list`. Labels não servem para
-# isso: o Linear CLI exige label pré-existente no team.
+# — mesmo formato do canonicalKey do registro ~/.local/state/work-os/repos.json.
+# Labels não servem para isso: o Linear exige label pré-existente no team.
 #
 # Projeto (repo→projeto, HEN-33): cada repo tem um projeto Linear homônimo —
 # último segmento do canonical key (github.com/henriquemeca/dotfiles → projeto
 # `dotfiles`). Dentro de um repo a issue é associada a esse projeto; fora de
 # repo, ou se o projeto não existir no workspace, cria sem projeto e avisa —
 # a captura nunca falha por causa de projeto.
+#
+# Offline: se a API do Linear falhar, a captura é appendada em
+# ~/.local/state/work-os/inbox.jsonl ({ts,title,body}) e nada se perde;
+# `work --drain` re-tenta as pendentes e remove as que passaram.
 
 set -o pipefail
 
 TEAM="${WORK_LINEAR_TEAM:-HEN}"
+INBOX="$HOME/.local/state/work-os/inbox.jsonl"
 
 # $0 de nível de script — dentro de função, zsh troca $0 pelo nome da função.
 SELF="$0"
@@ -29,12 +35,71 @@ usage() {
   sed -n '2,/^$/p' "$SELF" | sed 's/^# \{0,1\}//'
 }
 
+# Extrai "identifier url" do JSON plano do `linear-gql create` (uma linha por
+# resposta; stderr pode vir misturado, então tenta linha a linha).
+parse_created() {
+  print -r -- "$1" | python3 -c '
+import json, sys
+for line in sys.stdin.read().splitlines():
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        d = json.loads(line, strict=False)
+    except Exception:
+        continue
+    if d.get("identifier"):
+        print(d.get("identifier"), d.get("url", ""))
+        break
+' 2>/dev/null
+}
+
+# --drain: re-tenta cada linha do inbox offline; remove as que passaram,
+# mantém as que ainda falham (ou linhas corrompidas). Re-rodar é sempre seguro.
+drain() {
+  if [[ ! -s "$INBOX" ]]; then
+    print "work: inbox offline vazio — nada a drenar"
+    return 0
+  fi
+  local tmp="${INBOX}.tmp.$$"
+  : > "$tmp"
+  local total=0 sent=0 line title body out ident
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    (( total++ ))
+    title=$(print -r -- "$line" | python3 -c \
+      'import json, sys; print(json.loads(sys.stdin.read(), strict=False).get("title", ""))' 2>/dev/null)
+    if [[ -z "$title" ]]; then
+      print -u2 "work: linha inválida no inbox — mantida"
+      print -r -- "$line" >> "$tmp"
+      continue
+    fi
+    body=$(print -r -- "$line" | python3 -c \
+      'import json, sys; print(json.loads(sys.stdin.read(), strict=False).get("body", ""))' 2>/dev/null)
+    out=$(print -r -- "$body" | linear-gql create --team "$TEAM" --state Backlog \
+      --title "$title" --body-file - 2>&1)
+    if [[ $? -eq 0 ]] && ident=$(parse_created "$out") && [[ -n "$ident" ]]; then
+      print "✓ drenado: ${ident%% *} · $title"
+      (( sent++ ))
+    else
+      print -u2 "work: ainda falhando: $title"
+      print -r -- "$line" >> "$tmp"
+    fi
+  done < "$INBOX"
+  mv "$tmp" "$INBOX"
+  local left=$(( total - sent ))
+  print "drain: $sent/$total enviada(s) · $left pendente(s)"
+  (( left == 0 ))
+}
+
 popup=0
 project_flag=""
+do_drain=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --popup) popup=1; shift ;;
+    --drain) do_drain=1; shift ;;
     --project)
       if [[ -z "$2" ]]; then
         print -u2 "work: --project requer um nome"
@@ -46,6 +111,11 @@ while [[ $# -gt 0 ]]; do
     *) break ;;
   esac
 done
+
+if (( do_drain )); then
+  drain
+  exit $?
+fi
 
 title="$1"
 [[ $# -gt 0 ]] && shift
@@ -62,7 +132,7 @@ if [[ -z "$title" ]]; then
   read -r desc
 fi
 
-# Contexto: repo git atual → canonical key host/owner/repo (formato do Orca).
+# Contexto: repo git atual → canonical key host/owner/repo (formato do repos.json).
 repo_key=""
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   remote_url=$(git remote get-url origin 2>/dev/null)
@@ -80,13 +150,13 @@ if [[ -n "$repo_key" ]]; then
 fi
 
 # Projeto: --project sobrescreve; senão, inferido do repo (último segmento do
-# canonical key). `linear create --project` exige projeto existente com nome
-# exato, então valida antes via project list (match case-insensitive, usa o
-# nome exato retornado). Qualquer falha aqui vira aviso, nunca bloqueia a captura.
+# canonical key). `create --project` exige projeto existente com nome exato,
+# então valida antes via project-list (match case-insensitive, usa o nome
+# exato retornado). Qualquer falha aqui vira aviso, nunca bloqueia a captura.
 project_want="${project_flag:-${repo_key##*/}}"
 project=""
 if [[ -n "$project_want" ]]; then
-  project=$(orca linear project list --query "$project_want" --json 2>/dev/null |
+  project=$(linear-gql project-list --query "$project_want" 2>/dev/null |
     python3 -c '
 import json, sys
 want = sys.argv[1].casefold()
@@ -94,9 +164,7 @@ try:
     d = json.loads(sys.stdin.read(), strict=False)
 except Exception:
     sys.exit(1)
-if not d.get("ok"):
-    sys.exit(1)
-for p in d.get("result", {}).get("projects", []):
+for p in d.get("projects", []):
     if p.get("name", "").casefold() == want:
         print(p["name"])
         break
@@ -106,31 +174,28 @@ for p in d.get("result", {}).get("projects", []):
   fi
 fi
 
-create_args=(--title "$title" --team "$TEAM" --state Backlog --json)
+create_args=(--team "$TEAM" --state Backlog --title "$title")
 [[ -n "$project" ]] && create_args+=(--project "$project")
-if [[ -n "$body" ]]; then
-  out=$(print -r -- "$body" | orca linear create "${create_args[@]}" --body-file - 2>&1)
-else
-  out=$(orca linear create "${create_args[@]}" 2>&1)
-fi
+out=$(print -r -- "$body" | linear-gql create "${create_args[@]}" --body-file - 2>&1)
 rc=$?
 
-result=$(print -r -- "$out" | python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.stdin.read(), strict=False)
-except Exception:
-    sys.exit(1)
-if not d.get("ok"):
-    sys.exit(1)
-issue = d.get("result", {}).get("issue", d.get("result", {}))
-print(issue.get("identifier", "?"), issue.get("url", ""))
-' 2>/dev/null)
+result=""
+(( rc == 0 )) && result=$(parse_created "$out")
 
 if [[ $rc -ne 0 || -z "$result" ]]; then
   print -u2 "work: falha ao criar issue no Linear"
   print -u2 -r -- "$out"
-  print -u2 "dica: runtime do Orca fora do ar? tente \`orca open\`"
+  print -u2 "dica: falha na API do Linear (LINEAR_API_KEY? rede?)"
+  mkdir -p "${INBOX:h}"
+  TITLE="$title" BODY="$body" python3 - >> "$INBOX" <<'PY'
+import json, os, time
+print(json.dumps({
+    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    "title": os.environ["TITLE"],
+    "body": os.environ["BODY"],
+}, ensure_ascii=False))
+PY
+  print -u2 "work: guardado offline — rode work --drain"
   (( popup )) && { print -n "qualquer tecla fecha…"; read -k 1 -s; }
   exit 1
 fi

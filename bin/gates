@@ -1,0 +1,98 @@
+#!/bin/zsh
+# gates — fila local de decisões/perguntas para o humano (substitui os decision
+# gates do Orca no interview da triagem).
+#
+# Uso:
+#   gates create --task "<nome>" --question "<pergunta>"   imprime o id
+#   gates list [--status pending|resolved] [--json]        lista gates
+#   gates resolve --id <id> --resolution "<texto>"         resolve
+#   gates get --id <id> [--json]                           um gate
+#
+# Store: ~/.local/state/work-os/gates.jsonl — event-log append-only
+# (create/resolve); o estado corrente é o fold dos eventos. Apagável só se
+# você aceitar perder perguntas pendentes.
+
+set -o pipefail
+STORE="${WORK_OS_STATE:-$HOME/.local/state/work-os}/gates.jsonl"
+mkdir -p "${STORE:h}"
+touch "$STORE"
+
+exec python3 - "$STORE" "$@" <<'PY'
+import json, os, sys, time, uuid
+
+store, args = sys.argv[1], sys.argv[2:]
+
+def arg(flag, default=None):
+    return args[args.index(flag) + 1] if flag in args else default
+
+def die(msg):
+    print(f"gates: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def fold():
+    gates = {}
+    with open(store) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("ev") == "create":
+                gates[ev["id"]] = {"id": ev["id"], "task": ev.get("task", ""),
+                                   "question": ev.get("question", ""),
+                                   "status": "pending", "created_at": ev.get("ts"),
+                                   "resolution": None, "resolved_at": None}
+            elif ev.get("ev") == "resolve" and ev.get("id") in gates:
+                g = gates[ev["id"]]
+                g["status"] = "resolved"
+                g["resolution"] = ev.get("resolution", "")
+                g["resolved_at"] = ev.get("ts")
+    return gates
+
+def append(ev):
+    ev["ts"] = int(time.time())
+    with open(store, "a") as f:
+        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+
+if not args:
+    die("subcomando obrigatório (create|list|resolve|get)")
+cmd = args[0]
+
+if cmd == "create":
+    q = arg("--question") or die("--question obrigatório")
+    gid = uuid.uuid4().hex[:12]
+    append({"ev": "create", "id": gid, "task": arg("--task", ""), "question": q})
+    print(gid)
+
+elif cmd == "list":
+    status = arg("--status")
+    gates = [g for g in fold().values() if not status or g["status"] == status]
+    gates.sort(key=lambda g: g["created_at"] or 0)
+    if "--json" in args:
+        print(json.dumps({"gates": gates}, ensure_ascii=False))
+    else:
+        for g in gates:
+            mark = "⛔" if g["status"] == "pending" else "✓"
+            print(f'{mark} {g["id"]}  [{g["task"]}]  {g["question"][:100]}')
+
+elif cmd == "resolve":
+    gid = arg("--id") or die("--id obrigatório")
+    res = arg("--resolution") or die("--resolution obrigatório")
+    g = fold().get(gid) or die(f"gate {gid} não existe")
+    if g["status"] == "resolved":
+        die(f"gate {gid} já resolvido")
+    append({"ev": "resolve", "id": gid, "resolution": res})
+    print(f"✓ gate {gid} resolvido")
+
+elif cmd == "get":
+    gid = arg("--id") or die("--id obrigatório")
+    g = fold().get(gid) or die(f"gate {gid} não existe")
+    print(json.dumps(g, ensure_ascii=False) if "--json" in args
+          else f'{g["status"]} [{g["task"]}] {g["question"]}\n→ {g["resolution"] or "(pendente)"}')
+
+else:
+    die(f"subcomando desconhecido: {cmd}")
+PY

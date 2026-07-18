@@ -8,32 +8,35 @@
 #
 # Por issue (WOS-04/HEN-16): avalia clareza (goal/constraints/criteria — rubrica
 # deep-interview) com `claude -p` headless e age pelo veredito:
-#   ready      ambiguidade <= threshold → grava spec na description (via
-#              LINEAR_API_KEY; sem a key, spec vira comentário) e promove a Todo
-#   questions  perguntas viram gates da task "triagem KEY" → pendências no attn;
-#              responder: orca orchestration gate-resolve --id <gate> --resolution "…"
+#   ready      ambiguidade <= threshold → grava spec na description via
+#              linear-gql (fallback: spec vira comentário) e promove a Todo
+#   questions  perguntas viram gates locais (task "triagem KEY") → pendências
+#              no attn; responder: gates resolve --id <gate> --resolution "…"
 #   decompose  escopo grande → propõe sub-issues em Backlog (herdam trailer repo:)
 #              em vez de promover; a issue-mãe segue em Backlog como épico
 #   escalate   não convergiu (>= TRIAGE_MAX_ROUNDS rodadas) → gate dedicado de
 #              refinamento manual; issue fica em Backlog
 #
-# Idempotência: gate pendente na task → issue aguardando humano, é pulada;
-# resposta de gate resolvido vira comentário na issue (contexto da próxima
-# rodada); issue que já tem sub-issues é pulada.
+# Idempotência: gate pendente da task "triagem KEY" → issue aguardando humano,
+# é pulada; resposta de gate resolvido vira comentário na issue (contexto da
+# próxima rodada); issue que já tem sub-issues é pulada.
 #
 # Env: WORK_LINEAR_TEAM (HEN) · TRIAGE_THRESHOLD (0.20) · TRIAGE_MAX_ROUNDS (3)
-#      TRIAGE_MODEL (sonnet) · LINEAR_API_KEY (opcional — habilita o aceite
-#      "spec na description"; crie em linear.app/settings/api)
+#      TRIAGE_MODEL (sonnet) · LINEAR_API_KEY (env ou ~/.credentials.sh —
+#      o linear-gql resolve a auth sozinho)
 
 set -o pipefail
 
 # $0 dentro de função vira o nome da função (FUNCTION_ARGZERO); capturar aqui.
 SELF="$0"
+# irmãos do repo (linear-gql, gates) resolvem mesmo fora do PATH do usuário
+path=("${SELF:A:h}" $path)
 
 TEAM="${WORK_LINEAR_TEAM:-HEN}"
 THRESHOLD="${TRIAGE_THRESHOLD:-0.20}"
 MAX_ROUNDS="${TRIAGE_MAX_ROUNDS:-3}"
 MODEL="${TRIAGE_MODEL:-sonnet}"
+STATE_HOME="${WORK_OS_STATE:-$HOME/.local/state/work-os}"
 
 usage() {
   sed -n '2,8p' "$SELF" | sed 's/^# \{0,1\}//'
@@ -42,18 +45,6 @@ usage() {
 die() {
   print -u2 "triage: $*"
   exit 1
-}
-
-# Envelope JSON do orca com ok:true? (JSON pode ter control chars crus → strict=False)
-json_ok() {
-  RAW="$1" python3 - <<'PY'
-import json, os, sys
-try:
-    d = json.loads(os.environ["RAW"], strict=False)
-except Exception:
-    sys.exit(1)
-sys.exit(0 if d.get("ok") else 1)
-PY
 }
 
 # Campo do veredito normalizado ($1): strings cruas, listas/objetos como JSON.
@@ -87,26 +78,23 @@ done
 THRESHOLD="$THRESHOLD" python3 -c 'import os; t = float(os.environ["THRESHOLD"]); assert 0 < t < 1' 2>/dev/null \
   || die "TRIAGE_THRESHOLD inválido (fração 0..1): $THRESHOLD"
 command -v claude >/dev/null || die "claude CLI não encontrado — o assento da triagem é o Claude Code headless"
+command -v linear-gql >/dev/null || die "linear-gql não encontrado (esperado em ~/.local/bin ou ao lado deste script)"
+command -v gates >/dev/null || die "gates não encontrado (esperado em ~/.local/bin ou ao lado deste script)"
 
 state_dir=$(mktemp -d "${TMPDIR:-/tmp}/triage.XXXXXX") || die "mktemp falhou"
 trap 'rm -rf "$state_dir"' EXIT
 
-# ---------- estado atual: issues, tasks, gates, repos ----------
-issues_raw=$(orca linear list --filter open --team "$TEAM" --limit 100 --json 2>&1)
-json_ok "$issues_raw" || die "falha em \`orca linear list\` — runtime do Orca fora do ar? tente \`orca open\`"
+# ---------- estado atual: issues, gates, repos ----------
+issues_raw=$(linear-gql list --team "$TEAM" --state Backlog --limit 100) ||
+  die "falha em \`linear-gql list\` — rede/API do Linear fora do ar?"
 
 # Backlog ordenado por prioridade Linear (urgent→low, sem prioridade por último),
 # depois por key (FIFO aproximado) — mesma fila do linear-sync.
-backlog_lines=$(RAW="$issues_raw" TEAM="$TEAM" python3 - <<'PY'
+backlog_lines=$(RAW="$issues_raw" python3 - <<'PY'
 import json, os
 d = json.loads(os.environ["RAW"], strict=False)
-team = os.environ["TEAM"]
 rows = []
-for i in d.get("result", {}).get("issues", []):
-    if (i.get("state") or {}).get("name") != "Backlog":
-        continue
-    if (i.get("team") or {}).get("key") != team:
-        continue
+for i in d.get("issues", []):
     p = i.get("priority") or 0
     try:
         num = int(i["identifier"].rsplit("-", 1)[-1])
@@ -119,98 +107,19 @@ PY
 )
 typeset -a backlog=( ${(f)backlog_lines} )
 
-tasks_raw=$(orca orchestration task-list --json 2>&1)
-json_ok "$tasks_raw" || die "falha em \`orca orchestration task-list\`"
-gates_raw=$(orca orchestration gate-list --json 2>&1)
-json_ok "$gates_raw" || die "falha em \`orca orchestration gate-list\`"
+gates_raw=$(gates list --json) || die "falha em \`gates list\`"
 
-# task "triagem KEY" → id (âncora das pendências de uma issue entre execuções)
-task_lines=$(RAW="$tasks_raw" python3 - <<'PY'
+repos_csv=$(REPOS_FILE="$STATE_HOME/repos.json" python3 -c '
 import json, os
-d = json.loads(os.environ["RAW"], strict=False)
-for t in d.get("result", {}).get("tasks", []):
-    title = t.get("task_title") or ""
-    if title.startswith("triagem "):
-        print(title.split(" ", 1)[1] + "\t" + t["id"])
-PY
-)
-typeset -A task_id
-for line in ${(f)task_lines}; do
-  task_id[${line%%$'\t'*}]="${line#*$'\t'}"
-done
-
-repos_csv=$(orca repo list --json 2>/dev/null | python3 -c '
-import json, sys
 try:
-    d = json.loads(sys.stdin.read(), strict=False)
+    d = json.load(open(os.environ["REPOS_FILE"]))
 except Exception:
     d = {}
-keys = []
-for r in d.get("result", {}).get("repos", []):
-    k = (r.get("gitRemoteIdentity") or {}).get("canonicalKey")
-    if k:
-        keys.append(k)
-print(",".join(keys))
+print(",".join(sorted(k for k in d if isinstance(k, str) and k)))
 ')
 
 print "triage · team $TEAM · threshold $THRESHOLD · max rodadas $MAX_ROUNDS · modelo $MODEL · em Backlog: ${#backlog[@]}"
 (( dry_run )) && print "(dry-run: avalia e relata, nada será criado nem mutado)"
-[[ -z "$LINEAR_API_KEY" ]] && print "⚠ sem LINEAR_API_KEY — spec aprovada vai de comentário, não de description (crie em linear.app/settings/api e exporte em ~/.credentials.sh)"
-
-# ---------- helpers de ação ----------
-
-# Garante task de orquestração "triagem KEY"; ecoa o id.
-# (roda em subshell via $(…) — o cache task_id é atualizado pelo chamador)
-ensure_task() {
-  local key="$1"
-  if [[ -n "${task_id[$key]}" ]]; then
-    print -r -- "${task_id[$key]}"
-    return 0
-  fi
-  local raw
-  raw=$(orca orchestration task-create --spec "triagem $key — interview assíncrono (WOS-04)" \
-    --task-title "triagem $key" --display-name "triagem $key" --json 2>&1)
-  json_ok "$raw" || return 1
-  RAW="$raw" python3 -c '
-import json, os
-d = json.loads(os.environ["RAW"], strict=False)
-print(d["result"]["task"]["id"])'
-}
-
-# Cria gate na task; ecoa o gate id.
-create_gate() {
-  local tid="$1" question="$2" raw
-  raw=$(orca orchestration gate-create --task "$tid" --question "$question" --json 2>&1)
-  json_ok "$raw" || return 1
-  RAW="$raw" python3 -c '
-import json, os
-d = json.loads(os.environ["RAW"], strict=False)
-print(d["result"]["gate"]["id"])'
-}
-
-# Grava description via API GraphQL do Linear (exige LINEAR_API_KEY).
-update_description() {
-  ISSUE_UUID="$1" NEW_DESC="$2" python3 - <<'PY'
-import json, os, sys, urllib.request
-payload = json.dumps({
-    "query": "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
-    "variables": {"id": os.environ["ISSUE_UUID"], "input": {"description": os.environ["NEW_DESC"]}},
-}).encode()
-req = urllib.request.Request(
-    "https://api.linear.app/graphql", data=payload,
-    headers={"Content-Type": "application/json", "Authorization": os.environ["LINEAR_API_KEY"]})
-try:
-    with urllib.request.urlopen(req, timeout=30) as r:
-        d = json.load(r)
-except Exception as e:
-    print(f"issueUpdate: {e}", file=sys.stderr)
-    sys.exit(1)
-if d.get("errors"):
-    print(f"issueUpdate: {d['errors']}", file=sys.stderr)
-    sys.exit(1)
-sys.exit(0 if (d.get("data") or {}).get("issueUpdate", {}).get("success") else 1)
-PY
-}
 
 # ---------- loop por issue ----------
 typeset -a promoted questioned decomposed escalated waiting skipped failed
@@ -220,8 +129,7 @@ for key in "${backlog[@]}"; do
   [[ -n "$only" && "$key" != "$only" ]] && continue
   matched_only=1
 
-  issue_raw=$(orca linear issue "$key" --full --json 2>&1)
-  if ! json_ok "$issue_raw"; then
+  if ! issue_raw=$(linear-gql issue "$key"); then
     print "✗ $key · falha ao ler a issue"
     failed+=("$key")
     continue
@@ -230,28 +138,26 @@ for key in "${backlog[@]}"; do
   # Estado por issue: sub-issues? gates pendentes? respostas não consumidas?
   # quantas rodadas de perguntas já houve?
   gate_file="$state_dir/$key.gates.json"
-  RAW="$issue_raw" GATES="$gates_raw" TID="${task_id[$key]:-}" python3 - > "$gate_file" <<'PY'
+  RAW="$issue_raw" GATES="$gates_raw" TASK="triagem $key" python3 - > "$gate_file" <<'PY'
 import json, os
-res = json.loads(os.environ["RAW"], strict=False)["result"]
-gates = json.loads(os.environ["GATES"], strict=False).get("result", {}).get("gates", [])
-tid = os.environ["TID"]
-comments = [c.get("body") or "" for c in res.get("comments", [])]
+issue = json.loads(os.environ["RAW"], strict=False)
+gates = json.loads(os.environ["GATES"], strict=False).get("gates", [])
+task = os.environ["TASK"]
+comments = [c.get("body") or "" for c in (issue.get("comments") or {}).get("nodes") or []]
 blob = "\n".join(comments)
 out = {
-    "children": len(res.get("children", [])),
+    "children": len((issue.get("children") or {}).get("nodes") or []),
     "asked": sum(1 for c in comments if c.startswith("## Triagem — rodada")),
     "pending": 0,
     "unconsumed": [],   # resolvidos ainda sem comentário na issue
     "qa": [],           # histórico resolvido completo (contexto do interview)
 }
 for g in gates:
-    if not tid:
-        break
-    if g.get("task_id") != tid:
+    if g.get("task") != task:
         continue
     if g.get("status") == "pending":
         out["pending"] += 1
-    elif g.get("status") == "resolved":
+    elif g.get("status") == "resolved" and (g.get("resolution") or "").strip():
         qa = {"id": g["id"], "q": g.get("question") or "", "r": g.get("resolution") or ""}
         out["qa"].append(qa)
         # marcador distinto do "— gate `id`" que o comentário de rodada usa
@@ -286,7 +192,7 @@ import json, os
 qa = json.load(open(os.environ["GF"]))["unconsumed"][int(os.environ["IDX"])]
 print(f"**Pergunta (triagem):** {qa['q']}\n\n**Resposta:** {qa['r']}\n\nresposta gate `{qa['id']}`")
 PY
-        orca linear comment add "$key" --body-file - --json >/dev/null 2>&1 ||
+        linear-gql comment "$key" --body-file - >/dev/null ||
         print "  ⚠ $key · falha ao registrar resposta de gate como comentário"
     done
   fi
@@ -295,8 +201,7 @@ PY
   prompt=$(RAW="$issue_raw" GATEST="$(cat "$gate_file")" REPOS="$repos_csv" \
     THRESHOLD="$THRESHOLD" python3 - <<'PY'
 import json, os
-res = json.loads(os.environ["RAW"], strict=False)["result"]
-issue = res["issue"]
+issue = json.loads(os.environ["RAW"], strict=False)
 st = json.loads(os.environ["GATEST"])
 threshold = os.environ["THRESHOLD"]
 repos = os.environ["REPOS"]
@@ -311,7 +216,7 @@ parts.append(f"# Issue {issue['identifier']} — {(issue.get('state') or {}).get
 parts.append(f"Título: {issue.get('title') or '(sem título)'}")
 parts.append("Description:\n" + (issue.get("description") or "(vazia)"))
 
-comments = res.get("comments", [])
+comments = (issue.get("comments") or {}).get("nodes") or []
 if comments:
     cs = "\n\n".join(f"[{i+1}] {c.get('body') or ''}" for i, c in enumerate(comments))
     parts.append("# Comentários da issue (histórico, inclui rodadas anteriores da triagem)\n" + cs)
@@ -463,58 +368,46 @@ for s in json.load(open('$verdict_file'))['subissues']:
     spec=$(SPEC="$spec" RAW="$issue_raw" python3 - <<'PY'
 import json, os, re
 spec = os.environ["SPEC"]
-desc = json.loads(os.environ["RAW"], strict=False)["result"]["issue"].get("description") or ""
+desc = json.loads(os.environ["RAW"], strict=False).get("description") or ""
 m = re.search(r"repo: `[^`]+`", desc)
 if m and m.group(0) not in spec:
     spec = spec.rstrip() + "\n\n" + m.group(0)
 print(spec)
 PY
 )
-    issue_uuid=$(RAW="$issue_raw" python3 -c '
-import json, os
-print(json.loads(os.environ["RAW"], strict=False)["result"]["issue"]["id"])')
     spec_where="description"
-    if [[ -n "$LINEAR_API_KEY" ]]; then
-      update_description "$issue_uuid" "$spec" || {
-        print "  ⚠ $key · issueUpdate falhou — gravando spec como comentário"
-        spec_where="comentário"
-      }
-    else
+    print -r -- "$spec" | linear-gql update-description "$key" --body-file - >/dev/null || {
+      print "  ⚠ $key · update-description falhou — gravando spec como comentário"
       spec_where="comentário"
-    fi
+    }
     if [[ "$spec_where" == "comentário" ]]; then
-      { print "## Spec refinada (triagem) — cole na description"; print ""; print -r -- "$spec"; } |
-        orca linear comment add "$key" --body-file - --json >/dev/null 2>&1
+      if ! { print "## Spec refinada (triagem) — cole na description"; print ""; print -r -- "$spec"; } |
+          linear-gql comment "$key" --body-file - >/dev/null; then
+        print "✗ $key · spec não foi gravada em lugar nenhum — issue segue em Backlog"
+        failed+=("$key")
+        continue
+      fi
     fi
     print -r -- "## Triagem — promovida a Todo
 
 Ambiguidade final ${amb}% ≤ $(vf threshold_pct)% ($scores). Spec gravada em: $spec_where. $reason" |
-      orca linear comment add "$key" --body-file - --json >/dev/null 2>&1
-    st_raw=$(orca linear status set "$key" --to "Todo" --json 2>&1)
-    if ! json_ok "$st_raw"; then
+      linear-gql comment "$key" --body-file - >/dev/null ||
+      print "  ⚠ $key · falha ao registrar o comentário de promoção"
+    if ! linear-gql status-set "$key" --to Todo >/dev/null; then
       print "✗ $key · spec gravada, mas falhou ao mover p/ Todo — mova manualmente"
       failed+=("$key")
       continue
     fi
-    [[ -n "${task_id[$key]}" ]] &&
-      orca orchestration task-update --id "${task_id[$key]}" --status completed --json >/dev/null 2>&1
     print "✓ $key · ambiguidade ${amb}% → spec em $spec_where · Todo"
     promoted+=("$key")
     ;;
 
   questions)
-    tid=$(ensure_task "$key")
-    if [[ -z "$tid" ]]; then
-      print "✗ $key · falha ao criar task de orquestração"
-      failed+=("$key")
-      continue
-    fi
-    task_id[$key]="$tid"
     n_q=$(python3 -c "import json;print(len(json.load(open('$verdict_file'))['questions']))")
     typeset -a gate_ids=() gate_qs=()
     for (( i = 0; i < n_q; i++ )); do
       q=$(python3 -c "import json;print(json.load(open('$verdict_file'))['questions'][$i])")
-      gid=$(create_gate "$tid" "[$key] $q")
+      gid=$(gates create --task "triagem $key" --question "[$key] $q")
       if [[ -n "$gid" ]]; then
         gate_ids+=("$gid")
         gate_qs+=("$q")
@@ -527,7 +420,9 @@ Ambiguidade final ${amb}% ≤ $(vf threshold_pct)% ($scores). Spec gravada em: $
       failed+=("$key")
       continue
     fi
-    { print "## Triagem — rodada $round_n"
+    # o comentário de rodada é o contador do MAX_ROUNDS — falhar aqui deixaria a
+    # triagem perguntando para sempre; sem ele a issue é falha, não "questioned".
+    if ! { print "## Triagem — rodada $round_n"
       print ""
       print "Ambiguidade ${amb}% (threshold $(vf threshold_pct)%) · $scores. $reason"
       print ""
@@ -536,8 +431,12 @@ Ambiguidade final ${amb}% ≤ $(vf threshold_pct)% ($scores). Spec gravada em: $
         print "$i. ${gate_qs[$i]} — gate \`${gate_ids[$i]}\`"
       done
       print ""
-      print 'Responder: `orca orchestration gate-resolve --id <gate> --resolution "…"` — a resposta entra na próxima rodada da triagem.'
-    } | orca linear comment add "$key" --body-file - --json >/dev/null 2>&1
+      print 'Responder: `gates resolve --id <gate> --resolution "…"` — a resposta entra na próxima rodada da triagem.'
+    } | linear-gql comment "$key" --body-file - >/dev/null; then
+      print "✗ $key · gates criados, mas o comentário de rodada (contador do MAX_ROUNDS) falhou"
+      failed+=("$key")
+      continue
+    fi
     print "? $key · rodada $round_n · ambiguidade ${amb}% · ${#gate_ids[@]} pergunta(s) no attn"
     questioned+=("$key")
     ;;
@@ -550,21 +449,18 @@ Ambiguidade final ${amb}% ≤ $(vf threshold_pct)% ($scores). Spec gravada em: $
       body=$(VF="$verdict_file" IDX=$i RAW="$issue_raw" python3 - <<'PY'
 import json, os, re
 body = json.load(open(os.environ["VF"]))["subissues"][int(os.environ["IDX"])]["body"]
-desc = json.loads(os.environ["RAW"], strict=False)["result"]["issue"].get("description") or ""
+desc = json.loads(os.environ["RAW"], strict=False).get("description") or ""
 m = re.search(r"repo: `[^`]+`", desc)
 if m and m.group(0) not in body:
     body = body.rstrip() + "\n\n" + m.group(0)
 print(body)
 PY
 )
-      create_raw=$(print -r -- "$body" | orca linear create --title "$title" --team "$TEAM" \
-        --state Backlog --parent "$key" --body-file - --json 2>&1)
-      if json_ok "$create_raw"; then
+      if create_raw=$(print -r -- "$body" | linear-gql create --title "$title" --team "$TEAM" \
+          --state Backlog --parent "$key" --body-file -); then
         child=$(RAW="$create_raw" python3 -c '
 import json, os
-d = json.loads(os.environ["RAW"], strict=False)
-issue = d.get("result", {}).get("issue", d.get("result", {}))
-print(issue.get("identifier", "?"))')
+print(json.loads(os.environ["RAW"], strict=False).get("identifier", "?"))')
         child_keys+=("$child")
         print "  + $key → $child · $title"
       else
@@ -582,22 +478,15 @@ print(issue.get("identifier", "?"))')
       for c in "${child_keys[@]}"; do print -r -- "- $c"; done
       print ""
       print "Esta issue segue em Backlog como épico; promova/cancele conforme fizer sentido."
-    } | orca linear comment add "$key" --body-file - --json >/dev/null 2>&1
-    [[ -n "${task_id[$key]}" ]] &&
-      orca orchestration task-update --id "${task_id[$key]}" --status completed --json >/dev/null 2>&1
+    } | linear-gql comment "$key" --body-file - >/dev/null ||
+      print "  ⚠ $key · falha ao registrar o comentário de decomposição"
     print "⑃ $key · decomposta em ${#child_keys[@]} sub-issue(s) — segue em Backlog"
     decomposed+=("$key")
     ;;
 
   escalate)
-    tid=$(ensure_task "$key")
-    if [[ -z "$tid" ]]; then
-      print "✗ $key · falha ao criar task de orquestração"
-      failed+=("$key")
-      continue
-    fi
-    task_id[$key]="$tid"
-    gid=$(create_gate "$tid" "[$key] refinamento manual: $reason — refine a description e resolva este gate; a triagem reavalia")
+    gid=$(gates create --task "triagem $key" \
+      --question "[$key] refinamento manual: $reason — refine a description e resolva este gate; a triagem reavalia")
     if [[ -z "$gid" ]]; then
       print "✗ $key · falha ao criar gate de refinamento manual"
       failed+=("$key")
@@ -607,8 +496,9 @@ print(issue.get("identifier", "?"))')
 
 $reason (ambiguidade ${amb}%, $scores, após $asked rodada(s) de perguntas).
 
-Pendência dedicada no \`attn\`: gate \`$gid\`. Refine a description à mão e resolva o gate — a triagem então reavalia." |
-      orca linear comment add "$key" --body-file - --json >/dev/null 2>&1
+Pendência dedicada no \`attn\`: gate \`$gid\`. Refine a description à mão e resolva o gate (\`gates resolve --id $gid --resolution \"…\"\`) — a triagem então reavalia." |
+      linear-gql comment "$key" --body-file - >/dev/null ||
+      print "  ⚠ $key · falha ao registrar o comentário de escalada"
     print "⚑ $key · escalada p/ refinamento manual (gate $gid no attn)"
     escalated+=("$key")
     ;;

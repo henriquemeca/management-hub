@@ -1,5 +1,5 @@
 BIN_DIR := $(HOME)/.local/bin
-SCRIPTS := work attn wos triage linear-sync ship
+SCRIPTS := work attn wos triage linear-sync ship linear-gql gates wos-hook
 
 .PHONY: build test link unlink check
 
