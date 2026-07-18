@@ -2,9 +2,11 @@
 # wos — hub do Work OS: visão unificada e ponto de entrada único do ciclo.
 #
 # Uso:
-#   wos                  interativo (fzf): pendências + rodando + fila numa tela.
-#                        enter: pendência/rodando foca o pane · fila escolhe
-#                        modelo/effort e spawna
+#   wos                  interativo (fzf), em loop — a mesa única. enter age
+#                        por tipo: gate/msg responde inline (vazio = focar),
+#                        rodando foca o pane, ⇧ PR merged roda ship, fila
+#                        escolhe modelo/effort e spawna; no fim da lista,
+#                        ações: capturar / triage / sync. esc sai.
 #   wos ps [--tsv]       a mesma visão unificada em texto (--tsv = feed cru
 #                        `kind \t handle \t label`, proto-contrato do hub)
 #   wos spawn <KEY> [--model sonnet|opus|haiku] [--effort low|medium|high]
@@ -113,7 +115,10 @@ for w in ps.get("worktrees", []):
     pr_s = f' · PR #{pr["number"]} ({pr.get("state", "?")})' if pr else ""
     icon = {"working": "●", "waiting": "⏸", "done": "✔"}.get(st, "·")
     handle = by_worktree.get(w.get("worktreeId", ""), "")
-    print(f'run:{key}\t{handle}\t{icon} {key} · {st} · {agents} · {branch}{pr_s}')
+    if st == "done" and str(pr.get("state", "")).lower() == "merged":
+        print(f'ship:{key}\t{handle}\t⇧ {key} · PR #{pr["number"]} merged · falta ship (enter roda)')
+    else:
+        print(f'run:{key}\t{handle}\t{icon} {key} · {st} · {agents} · {branch}{pr_s}')
 
 # fila: Todo do team — mesma chave de ordenação do linear-sync
 # (contrato: prioridade Linear, depois key; manter em sincronia lá).
@@ -137,8 +142,12 @@ PY
 
 # Visão unificada: pendências (attn --tsv, sem as linhas summary) + rodando + fila.
 gather_all() {
-  local pend rows
-  pend=$("$(sibling attn)" --tsv 2>/dev/null |
+  local pend rows attn_bin
+  # sibling em command substitution não pode "die" (subshell) — attn ausente
+  # degrada para painel sem pendências, em silêncio.
+  attn_bin=$(sibling attn 2>/dev/null) || attn_bin=""
+  pend=""
+  [[ -n "$attn_bin" ]] && pend=$("$attn_bin" --tsv 2>/dev/null |
     awk -F'\t' '$1 ~ /^(gate:|msg:|input$|orphan$)/')
   rows=$(gather_rows) || return 1
   [[ -n "$pend" ]] && print -r -- "$pend"
@@ -193,23 +202,23 @@ cmd_ps() {
   fi
   local -a pend=( ${(f)"$(print -r -- "$rows" |
     awk -F'\t' '$1 ~ /^(gate:|msg:|input$|orphan$)/')"} )
-  local -a run=( ${(f)"$(print -r -- "$rows" | grep '^run:')"} )
+  local -a run=( ${(f)"$(print -r -- "$rows" | grep -E '^(run|ship):')"} )
   local -a queue=( ${(f)"$(print -r -- "$rows" | grep '^queue:')"} )
   print "pendências (${#pend[@]}):"
   if (( ${#pend[@]} )); then
-    for r in "${pend[@]}"; do print "  ${r##*$'\t'}"; done
+    for r in "${pend[@]}"; do print -r -- "  ${r##*$'\t'}"; done
   else
     print "  (nenhuma — nada precisa de você)"
   fi
   print "rodando (${#run[@]}/cap $CAP):"
   if (( ${#run[@]} )); then
-    for r in "${run[@]}"; do print "  ${r##*$'\t'}"; done
+    for r in "${run[@]}"; do print -r -- "  ${r##*$'\t'}"; done
   else
     print "  (nenhum worktree vinculado a issue)"
   fi
   print "fila Todo (${#queue[@]}, ordem do sync):"
   if (( ${#queue[@]} )); then
-    for r in "${queue[@]}"; do print "  ${r##*$'\t'}"; done
+    for r in "${queue[@]}"; do print -r -- "  ${r##*$'\t'}"; done
   else
     print "  (vazia)"
   fi
@@ -285,66 +294,129 @@ cmd_go() {
   fi
 }
 
-# ---------- interativo (default): visão unificada ----------
-cmd_fzf() {
-  command -v fzf >/dev/null || { cmd_ps; return }
-  local rows
-  rows=$(gather_all) || exit 1
-  [[ -z "$rows" ]] && { print "wos: nada rodando, sem pendências, fila vazia"; return }
+# ---------- interativo (default): mesa única em loop ----------
+pause_panel() {
+  print
+  print -n "qualquer tecla volta ao painel…"
+  read -k 1 -s
+  print
+}
 
-  local sel
-  sel=$(print -r -- "$rows" |
-    fzf --delimiter '\t' --with-nth 3 --no-multi \
-        --header "⛔✉⏸ pendência / ● rodando: enter foca · ○ fila: enter spawna · peek/say/go via CLI" \
-        --prompt 'wos> ' --height=100% --layout=reverse)
-  [[ -z "$sel" ]] && return
+pick_and_spawn() {
+  local key="$1"
+  local msel model effort
+  msel=$(printf '%s\n' \
+    $'default\t(trailer agent-config da issue, senão sonnet/medium)' \
+    $'sonnet\trotina — task bem especificada' \
+    $'opus\tdesign, arquitetura, task ambígua' \
+    $'haiku\tmecânico — rename, config, doc' |
+    fzf --delimiter '\t' --with-nth 1,2 --no-multi \
+        --header "modelo p/ $key" --prompt 'modelo> ' --height=40% --layout=reverse)
+  [[ -z "$msel" ]] && return
+  model="${msel%%$'\t'*}"
+  msel=$(printf '%s\n' \
+    $'default\t(trailer da issue, senão medium)' \
+    $'low\tmecânico' \
+    $'medium\trotina' \
+    $'high\tdesign/ambíguo' |
+    fzf --delimiter '\t' --with-nth 1,2 --no-multi \
+        --header "effort p/ $key ($model)" --prompt 'effort> ' --height=40% --layout=reverse)
+  [[ -z "$msel" ]] && return
+  effort="${msel%%$'\t'*}"
+  local -a flags=()
+  [[ "$model" != default ]] && flags+=(--model "$model")
+  [[ "$effort" != default ]] && flags+=(--effort "$effort")
+  cmd_spawn "$key" "${flags[@]}"
+  pause_panel
+}
 
-  local kind="${sel%%$'\t'*}"
-  local rest="${sel#*$'\t'}"
-  local handle="${rest%%$'\t'*}"
-  local label="${rest#*$'\t'}"
+focus_pane() {
+  local handle="$1" label="$2"
+  if [[ -n "$handle" ]] && orca terminal switch --terminal "$handle" --json >/dev/null 2>&1; then
+    print -r -- "→ focado no app Orca: $label"
+  else
+    print -u2 "wos: pane não encontrado"
+    pause_panel
+  fi
+}
 
+# gate/msg: responder inline direto do painel; resposta vazia = focar o pane.
+answer_inline() {
+  local kind="$1" handle="$2" label="$3"
+  print -r -- "$label"
+  local resp=""
+  read -r "resp?resposta (vazio = focar pane, esc+enter cancela)> "
+  # esc+enter (ou sequência de seta) chega como \e literal no buffer — cancelar,
+  # nunca resolver o gate com caractere de controle como resposta.
+  [[ "$resp" == *$'\e'* ]] && { print "cancelado"; return }
+  if [[ -z "$resp" ]]; then
+    focus_pane "$handle" "$label"
+    return
+  fi
   case "$kind" in
-    run:*|input|orphan|gate:*|msg:*)
-      if [[ -n "$handle" ]] && orca terminal switch --terminal "$handle" --json >/dev/null 2>&1; then
-        print "→ focado no app Orca: $label"
-      else
-        print -r -- "$label"
-        case "$kind" in
-          gate:*) print "resolver: orca orchestration gate-resolve --id ${kind#gate:} --resolution '<texto>'" ;;
-          msg:*)  print "responder: orca orchestration reply --id ${kind#msg:} --body '<texto>'" ;;
-          run:*)  print -u2 "wos: pane não encontrado para ${kind#run:}" ;;
-          *)      print "(pendência sem pane associado)" ;;
-        esac
-      fi
+    gate:*)
+      orca orchestration gate-resolve --id "${kind#gate:}" --resolution "$resp" --json \
+        >/dev/null 2>&1 && print "✓ gate resolvido (a resposta entra na próxima rodada da triagem)" ||
+        print -u2 "wos: falha ao resolver o gate ${kind#gate:}"
       ;;
-    queue:*)
-      local key="${kind#queue:}"
-      local msel model effort
-      msel=$(printf '%s\n' \
-        $'default\t(trailer agent-config da issue, senão sonnet/medium)' \
-        $'sonnet\trotina — task bem especificada' \
-        $'opus\tdesign, arquitetura, task ambígua' \
-        $'haiku\tmecânico — rename, config, doc' |
-        fzf --delimiter '\t' --with-nth 1,2 --no-multi \
-            --header "modelo p/ $key" --prompt 'modelo> ' --height=40% --layout=reverse)
-      [[ -z "$msel" ]] && return
-      model="${msel%%$'\t'*}"
-      msel=$(printf '%s\n' \
-        $'default\t(trailer da issue, senão medium)' \
-        $'low\tmecânico' \
-        $'medium\trotina' \
-        $'high\tdesign/ambíguo' |
-        fzf --delimiter '\t' --with-nth 1,2 --no-multi \
-            --header "effort p/ $key ($model)" --prompt 'effort> ' --height=40% --layout=reverse)
-      [[ -z "$msel" ]] && return
-      effort="${msel%%$'\t'*}"
-      local -a flags=()
-      [[ "$model" != default ]] && flags+=(--model "$model")
-      [[ "$effort" != default ]] && flags+=(--effort "$effort")
-      cmd_spawn "$key" "${flags[@]}"
+    msg:*)
+      orca orchestration reply --id "${kind#msg:}" --body "$resp" --json \
+        >/dev/null 2>&1 && print "✓ resposta enviada" ||
+        print -u2 "wos: falha ao responder a mensagem ${kind#msg:}"
       ;;
   esac
+  pause_panel
+}
+
+cmd_fzf() {
+  command -v fzf >/dev/null || { cmd_ps; return }
+  # se um caller exótico nos der stdin não-tty, os read/scripts interativos
+  # receberiam EOF — religar no tty do terminal.
+  [[ -t 0 ]] || exec </dev/tty
+  local actions rows sel kind rest handle label
+  actions=$'act:capture\t\t＋ capturar ideia (work)\nact:triage\t\t▸ triage — refinar Backlog\nact:sync\t\t▸ sync — spawn em lote da fila'
+
+  while true; do
+    rows=$(gather_all) || exit 1
+    if [[ -n "$rows" ]]; then
+      rows="$rows"$'\n'"$actions"
+    else
+      rows="$actions"
+    fi
+
+    sel=$(print -r -- "$rows" |
+      fzf --delimiter '\t' --with-nth 3 --no-multi \
+          --header "enter age por tipo · ⛔✉ responde/foca · ● foca · ⇧ ship · ○ spawna · esc sai" \
+          --prompt 'wos> ' --height=100% --layout=reverse)
+    [[ -z "$sel" ]] && return
+
+    kind="${sel%%$'\t'*}"
+    rest="${sel#*$'\t'}"
+    handle="${rest%%$'\t'*}"
+    label="${rest#*$'\t'}"
+
+    case "$kind" in
+      gate:*|msg:*) answer_inline "$kind" "$handle" "$label" ;;
+      run:*|input|orphan) focus_pane "$handle" "$label" ;;
+      ship:*)
+        "$(sibling ship)" "${kind#ship:}"
+        pause_panel
+        ;;
+      queue:*) pick_and_spawn "${kind#queue:}" ;;
+      act:capture)
+        "$(sibling work)"
+        pause_panel
+        ;;
+      act:triage)
+        "$(sibling triage)"
+        pause_panel
+        ;;
+      act:sync)
+        "$(sibling linear-sync)"
+        pause_panel
+        ;;
+    esac
+  done
 }
 
 case "$1" in
