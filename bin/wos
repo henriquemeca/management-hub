@@ -1,0 +1,245 @@
+#!/bin/zsh
+# wos — cockpit de coordenação do Work OS: quem roda, quem espera, e spawn
+# consciente de modelo+effort por task (HEN-38).
+#
+# Uso:
+#   wos                  interativo (fzf): rodando + fila. Enter numa issue da
+#                        fila → escolhe modelo/effort e spawna; enter numa
+#                        rodando → foca o pane no app Orca (como o attn).
+#   wos ps [--tsv]       visão de coordenação (texto): rodando + fila
+#   wos spawn <KEY> [--model sonnet|opus|haiku] [--effort low|medium|high]
+#                  [--agent claude|…] [--dry-run]
+#                        disparo individual consciente. Sem flags → trailer
+#                        agent-config da issue, senão política default.
+#
+# Política default de modelo/effort:
+#   sonnet/medium   rotina — task bem especificada, bugfix com repro
+#   opus/high       design, arquitetura, task ambígua ou de alto risco
+#   haiku/low       mecânico — rename, config, doc, mudança trivial
+# Por issue: trailer "agent-config: `model=<m> effort=<e>`" no body (mesmo
+# estilo do trailer repo:). Precedência: flags CLI > trailer > default.
+#
+# Motor de spawn: linear-sync --only <KEY> com overrides via env
+# (LINEAR_SYNC_MODEL/LINEAR_SYNC_EFFORT/LINEAR_SYNC_AGENT) — resolução de
+# trailer, dedup e cap vivem lá; wos não duplica essa lógica.
+# Fila: issues Todo do team (WORK_LINEAR_TEAM, default HEN), na ordem que o
+# linear-sync consome: prioridade Linear (urgent→low, sem prioridade por
+# último), depois key — contrato compartilhado com o linear-sync.
+
+set -o pipefail
+
+TEAM="${WORK_LINEAR_TEAM:-HEN}"
+CAP="${LINEAR_SYNC_CAP:-2}"
+
+# $0 de nível de script — dentro de função, zsh troca $0 pelo nome da função.
+SELF="$0"
+usage() {
+  # Todo o bloco de comentário do cabeçalho (até a primeira linha em branco).
+  sed -n '2,/^$/p' "$SELF" | sed 's/^# \{0,1\}//'
+}
+
+die() {
+  print -u2 "wos: $*"
+  exit 1
+}
+
+typeset -a VALID_MODELS=(sonnet opus haiku)
+typeset -a VALID_EFFORTS=(low medium high)
+
+# linear-sync mora ao lado do wos (repo ou ~/.local/bin, ambos stowed).
+sync_bin() {
+  local s="${SELF:A:h}/linear-sync"
+  [[ -x "$s" ]] && { print -r -- "$s"; return }
+  command -v linear-sync || die "linear-sync não encontrado (é o motor do spawn)"
+}
+
+# Emite TSV `kind \t handle \t label`:
+#   run:<KEY>    worktree ativo vinculado (handle = pane p/ focar)
+#   queue:<KEY>  issue em Todo, na ordem do linear-sync
+gather_rows() {
+  local ps_json issues_json terms_json
+  ps_json=$(orca worktree ps --json 2>&1)
+  print -r -- "$ps_json" | grep -q '"ok": *true' ||
+    die "runtime do Orca fora do ar? tente \`orca open\`"
+  issues_json=$(orca linear list --filter open --team "$TEAM" --limit 100 --json 2>/dev/null)
+  terms_json=$(orca terminal list --json 2>/dev/null)
+
+  TEAM="$TEAM" python3 - "$ps_json" "$issues_json" "$terms_json" <<'PY'
+import json, os, sys
+
+def load(raw):
+    try:
+        d = json.loads(raw, strict=False)
+        return d.get("result", {}) if d.get("ok") else {}
+    except Exception:
+        return {}
+
+ps, issues, terms = (load(a) for a in sys.argv[1:4])
+team = os.environ["TEAM"]
+
+by_worktree = {}
+for t in terms.get("terminals", []):
+    by_worktree.setdefault(t["worktreeId"], t["handle"])
+
+# rodando: worktrees ativos com issue vinculada (aceite 1)
+for w in ps.get("worktrees", []):
+    if w.get("isArchived") or not w.get("linkedLinearIssue"):
+        continue
+    key = w["linkedLinearIssue"]
+    states = [a.get("state") for a in w.get("agents", [])]
+    if "working" in states:
+        st = "working"
+    elif any(s in ("waiting", "interrupted") for s in states):
+        st = "waiting"
+    elif "done" in states:
+        st = "done"
+    else:
+        st = states[0] if states else "sem agente"
+    agents = ",".join(sorted({a.get("agentType", "?") for a in w.get("agents", [])})) or "-"
+    branch = (w.get("branch") or "").replace("refs/heads/", "")
+    pr = w.get("linkedPR") or {}
+    pr_s = f' · PR #{pr["number"]} ({pr.get("state", "?")})' if pr else ""
+    icon = {"working": "●", "waiting": "⏸", "done": "✔"}.get(st, "·")
+    handle = by_worktree.get(w.get("worktreeId", ""), "")
+    print(f'run:{key}\t{handle}\t{icon} {key} · {st} · {agents} · {branch}{pr_s}')
+
+# fila: Todo do team — mesma chave de ordenação do linear-sync
+# (contrato: prioridade Linear, depois key; manter em sincronia lá).
+todo = []
+for i in issues.get("issues", []):
+    if (i.get("state") or {}).get("name") != "Todo":
+        continue
+    if (i.get("team") or {}).get("key") != team:
+        continue
+    p = i.get("priority") or 0
+    try:
+        num = int(i["identifier"].rsplit("-", 1)[-1])
+    except ValueError:
+        num = 10**9
+    todo.append((0 if p else 1, p, num, i["identifier"], i.get("title", "")))
+prio = {0: "—", 1: "P1", 2: "P2", 3: "P3", 4: "P4"}
+for _, p, _, key, title in sorted(todo):
+    print(f'queue:{key}\t\t○ {key} · {prio.get(p, "?")} · {title[:80]}')
+PY
+}
+
+# ---------- wos ps ----------
+cmd_ps() {
+  local tsv=0
+  [[ "$1" == --tsv ]] && tsv=1
+  local rows
+  rows=$(gather_rows) || exit 1
+  if (( tsv )); then
+    print -r -- "$rows"
+    return
+  fi
+  local -a run=( ${(f)"$(print -r -- "$rows" | grep '^run:')"} )
+  local -a queue=( ${(f)"$(print -r -- "$rows" | grep '^queue:')"} )
+  print "rodando (${#run[@]}/cap $CAP):"
+  if (( ${#run[@]} )); then
+    for r in "${run[@]}"; do print "  ${r##*$'\t'}"; done
+  else
+    print "  (nenhum worktree vinculado a issue)"
+  fi
+  print "fila Todo (${#queue[@]}, ordem do sync):"
+  if (( ${#queue[@]} )); then
+    for r in "${queue[@]}"; do print "  ${r##*$'\t'}"; done
+  else
+    print "  (vazia)"
+  fi
+}
+
+# ---------- wos spawn ----------
+cmd_spawn() {
+  local key="" model="" effort="" agent="" dry=0
+  while (( $# )); do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      --model)  shift; model="$1" ;;
+      --effort) shift; effort="$1" ;;
+      --agent)  shift; agent="$1" ;;
+      --dry-run) dry=1 ;;
+      -*) die "flag desconhecida: $1 (veja wos --help)" ;;
+      *) [[ -n "$key" ]] && die "só uma issue por spawn (recebi '$key' e '$1')"
+         key="${(U)1}" ;;
+    esac
+    shift
+  done
+  [[ -n "$key" ]] || die "spawn requer uma issue key (ex.: wos spawn HEN-42)"
+  [[ -z "$model" || ${VALID_MODELS[(Ie)$model]} -gt 0 ]] ||
+    die "--model inválido: $model (use: $VALID_MODELS)"
+  [[ -z "$effort" || ${VALID_EFFORTS[(Ie)$effort]} -gt 0 ]] ||
+    die "--effort inválido: $effort (use: $VALID_EFFORTS)"
+
+  local -a envv=()
+  [[ -n "$model" ]] && envv+=("LINEAR_SYNC_MODEL=$model")
+  [[ -n "$effort" ]] && envv+=("LINEAR_SYNC_EFFORT=$effort")
+  [[ -n "$agent" ]] && envv+=("LINEAR_SYNC_AGENT=$agent")
+  local -a args=(--only "$key")
+  (( dry )) && args+=(--dry-run)
+  env "${envv[@]}" "$(sync_bin)" "${args[@]}"
+}
+
+# ---------- interativo (default) ----------
+cmd_fzf() {
+  command -v fzf >/dev/null || { cmd_ps; return }
+  local rows
+  rows=$(gather_rows) || exit 1
+  [[ -z "$rows" ]] && { print "wos: nada rodando e fila vazia"; return }
+
+  local sel
+  sel=$(print -r -- "$rows" |
+    fzf --delimiter '\t' --with-nth 3 --no-multi \
+        --header "● rodando: enter foca o pane · ○ fila: enter escolhe modelo/effort e spawna" \
+        --prompt 'wos> ' --height=100% --layout=reverse)
+  [[ -z "$sel" ]] && return
+
+  local kind="${sel%%$'\t'*}"
+  local rest="${sel#*$'\t'}"
+  local handle="${rest%%$'\t'*}"
+  local label="${rest#*$'\t'}"
+
+  case "$kind" in
+    run:*)
+      if [[ -n "$handle" ]] && orca terminal switch --terminal "$handle" --json >/dev/null 2>&1; then
+        print "→ focado no app Orca: $label"
+      else
+        print -u2 "wos: pane não encontrado para ${kind#run:}"
+      fi
+      ;;
+    queue:*)
+      local key="${kind#queue:}"
+      local msel model effort
+      msel=$(printf '%s\n' \
+        $'default\t(trailer agent-config da issue, senão sonnet/medium)' \
+        $'sonnet\trotina — task bem especificada' \
+        $'opus\tdesign, arquitetura, task ambígua' \
+        $'haiku\tmecânico — rename, config, doc' |
+        fzf --delimiter '\t' --with-nth 1,2 --no-multi \
+            --header "modelo p/ $key" --prompt 'modelo> ' --height=40% --layout=reverse)
+      [[ -z "$msel" ]] && return
+      model="${msel%%$'\t'*}"
+      msel=$(printf '%s\n' \
+        $'default\t(trailer da issue, senão medium)' \
+        $'low\tmecânico' \
+        $'medium\trotina' \
+        $'high\tdesign/ambíguo' |
+        fzf --delimiter '\t' --with-nth 1,2 --no-multi \
+            --header "effort p/ $key ($model)" --prompt 'effort> ' --height=40% --layout=reverse)
+      [[ -z "$msel" ]] && return
+      effort="${msel%%$'\t'*}"
+      local -a flags=()
+      [[ "$model" != default ]] && flags+=(--model "$model")
+      [[ "$effort" != default ]] && flags+=(--effort "$effort")
+      cmd_spawn "$key" "${flags[@]}"
+      ;;
+  esac
+}
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+  ps)    shift; cmd_ps "$@" ;;
+  spawn) shift; cmd_spawn "$@" ;;
+  "")    cmd_fzf ;;
+  *)     usage >&2; die "subcomando desconhecido: $1" ;;
+esac

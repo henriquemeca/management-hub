@@ -1,0 +1,165 @@
+#!/bin/zsh
+# attn — painel de atenção: agrega pendências que exigem o humano e leva ao pane certo.
+#
+# Uso:
+#   attn             interativo (fzf) → selecionar foca o tab no app Orca
+#   attn --list      só lista as pendências (sem fzf), para scripts/testes
+#   attn --tsv       lista crua `tipo<TAB>handle<TAB>label`, para integrações
+#   attn --popup     interativo + pausa final (popup tmux)
+#
+# Fontes agregadas (app Orca, não tmux — ver discovery no HEN-13):
+#   gates pendentes    orca orchestration gate-list   (aprovação, design, permissão, custo)
+#   mensagens          orca orchestration inbox       (perguntas de workers/refinamento)
+#   agents esperando   orca worktree ps               (waiting/interrupted → pane exato)
+#   worktrees órfãos   orca worktree ps               (sem issue vinculada)
+# Sem pendências → resumo das sessões por worktree.
+
+set -o pipefail
+
+# $0 de nível de script — dentro de função, zsh troca $0 pelo nome da função.
+SELF="$0"
+usage() {
+  sed -n '2,8p' "$SELF" | sed 's/^# \{0,1\}//'
+}
+
+mode=fzf
+popup=0
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+  --list) mode=list ;;
+  --tsv) mode=tsv ;;
+  --popup) popup=1 ;;
+esac
+
+pause() { (( popup )) && { print -n "qualquer tecla fecha…"; read -k 1 -s; } }
+
+ps_json=$(orca worktree ps --json 2>&1)
+if [[ $? -ne 0 ]] || ! print -r -- "$ps_json" | grep -q '"ok": *true'; then
+  print -u2 "attn: runtime do Orca fora do ar? tente \`orca open\`"
+  pause
+  exit 1
+fi
+gates_json=$(orca orchestration gate-list --status pending --json 2>/dev/null)
+inbox_json=$(orca orchestration inbox --json 2>/dev/null)
+terms_json=$(orca terminal list --json 2>/dev/null)
+tasks_json=$(orca orchestration task-list --json 2>/dev/null)
+
+# Junta as fontes e emite TSV: tipo \t handle \t label
+# (handle vazio = pendência sem pane; selecionar mostra a ação em vez de focar)
+rows=$(python3 - "$ps_json" "$gates_json" "$inbox_json" "$terms_json" "$tasks_json" <<'PY'
+import json, sys
+
+def load(raw):
+    try:
+        d = json.loads(raw, strict=False)
+        return d.get("result", {}) if d.get("ok") else {}
+    except Exception:
+        return {}
+
+ps, gates, inbox, terms, tasks = (load(a) for a in sys.argv[1:6])
+
+terminals = terms.get("terminals", [])
+by_pane = {f'{t["tabId"]}:{t["leafId"]}': t["handle"] for t in terminals}
+by_worktree = {}
+for t in terminals:
+    by_worktree.setdefault(t["worktreeId"], t["handle"])
+task_terminal = {t["id"]: t.get("created_by_terminal_handle") or ""
+                 for t in tasks.get("tasks", [])}
+
+def issue_of(w):
+    return w.get("linkedLinearIssue") or w.get("linkedIssue") or ""
+
+def emit(kind, handle, label):
+    print(f'{kind}\t{handle}\t{label}')
+
+worktrees = ps.get("worktrees", [])
+pend = 0
+
+# handles antigos de gates/msgs seguem válidos para `switch` (o list só emite
+# aliases novos); se o pane tiver morrido, o switch falha e o attn avisa.
+for g in gates.get("gates", []):
+    q = (g.get("question") or "?").replace("\n", " ")[:100]
+    handle = task_terminal.get(g.get("task_id", ""), "")
+    emit(f'gate:{g.get("id", "")}', handle, f'⛔ gate · {q}')
+    pend += 1
+
+for m in inbox.get("messages", []):
+    if m.get("read"):
+        continue
+    subj = (m.get("subject") or "?").replace("\n", " ")[:80]
+    emit(f'msg:{m.get("id", "")}', m.get("from_handle") or "", f'✉ msg · {subj}')
+    pend += 1
+
+for w in worktrees:
+    name = w.get("displayName", "?")
+    issue = issue_of(w)
+    tag = f' · {issue}' if issue else ""
+    for a in w.get("agents", []):
+        state = a.get("state")
+        if state not in ("waiting", "interrupted") and not a.get("interrupted"):
+            continue
+        tool = a.get("toolName") or state
+        handle = by_pane.get(a.get("paneKey", ""), "")
+        emit("input", handle,
+             f'⏸ input · {name}{tag} · {a.get("agentType", "?")} esperando ({tool})')
+        pend += 1
+    if not w.get("isMainWorktree") and not issue and not w.get("linkedPR") \
+            and not w.get("isArchived"):
+        emit("orphan", by_worktree.get(w.get("worktreeId", ""), ""),
+             f'⚠ órfão · {name} sem issue vinculada ({w.get("branch", "")})')
+        pend += 1
+
+if pend == 0:
+    # aceite 3: sem pendências → resumo das sessões
+    for w in worktrees:
+        issue = issue_of(w)
+        tag = f' · {issue}' if issue else ""
+        agents = ", ".join(
+            f'{a.get("agentType", "?")}:{a.get("state", "?")}' for a in w.get("agents", [])
+        ) or "sem agents"
+        handle = by_worktree.get(w.get("worktreeId", ""), "")
+        emit("summary", handle,
+             f'● {w.get("displayName", "?")}{tag} — {w.get("status", "idle")} · {agents}')
+PY
+)
+
+if [[ -z "$rows" ]]; then
+  print "attn: nenhuma sessão ativa"
+  pause
+  exit 0
+fi
+
+if [[ "$mode" == list ]]; then
+  print -r -- "$rows" | cut -f3
+  exit 0
+elif [[ "$mode" == tsv ]]; then
+  print -r -- "$rows"
+  exit 0
+fi
+
+header="pendências → enter foca o pane no app Orca"
+print -r -- "$rows" | head -1 | grep -q '^summary' &&
+  header="sem pendências — sessões ativas (enter foca)"
+
+sel=$(print -r -- "$rows" |
+  fzf --delimiter '\t' --with-nth 3 --no-multi --header "$header" \
+      --prompt 'atenção> ' --height=100% --layout=reverse)
+[[ -z "$sel" ]] && exit 0
+
+kind="${sel%%$'\t'*}"
+rest="${sel#*$'\t'}"
+handle="${rest%%$'\t'*}"
+label="${rest#*$'\t'}"
+
+if [[ -n "$handle" ]] && orca terminal switch --terminal "$handle" --json >/dev/null 2>&1; then
+  print "→ focado no app Orca: $label"
+else
+  [[ -n "$handle" ]] && print -u2 "attn: pane não encontrado ($handle)"
+  print -r -- "$label"
+  case "$kind" in
+    gate:*) print "resolver: orca orchestration gate-resolve --id ${kind#gate:} --resolution '<texto>'" ;;
+    msg:*)  print "responder: orca orchestration reply --id ${kind#msg:} --body '<texto>'" ;;
+    *)      print "(pendência sem pane associado)" ;;
+  esac
+  pause
+fi

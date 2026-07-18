@@ -1,0 +1,146 @@
+#!/bin/zsh
+# work — captura crua: cabeça → Linear (team HEN, estado Backlog) em segundos.
+#
+# Uso:
+#   work "<título>" [descrição...]   captura direta
+#   work                             modo interativo (prompt de título/descrição)
+#   work --popup                     interativo + pausa final (popup tmux)
+#   work --project <nome>            força o projeto Linear (pula a inferência)
+#
+# Vínculo repo→issue (repo-mapping consumido pelo loop de spawn, HEN-14):
+# executado dentro de um repo git, o body ganha a linha `repo: <host/owner/repo>`
+# — mesmo formato do canonicalKey de `orca repo list`. Labels não servem para
+# isso: o Linear CLI exige label pré-existente no team.
+#
+# Projeto (repo→projeto, HEN-33): cada repo tem um projeto Linear homônimo —
+# último segmento do canonical key (github.com/henriquemeca/dotfiles → projeto
+# `dotfiles`). Dentro de um repo a issue é associada a esse projeto; fora de
+# repo, ou se o projeto não existir no workspace, cria sem projeto e avisa —
+# a captura nunca falha por causa de projeto.
+
+set -o pipefail
+
+TEAM="${WORK_LINEAR_TEAM:-HEN}"
+
+# $0 de nível de script — dentro de função, zsh troca $0 pelo nome da função.
+SELF="$0"
+usage() {
+  # Todo o bloco de comentário do cabeçalho (até a primeira linha em branco).
+  sed -n '2,/^$/p' "$SELF" | sed 's/^# \{0,1\}//'
+}
+
+popup=0
+project_flag=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --popup) popup=1; shift ;;
+    --project)
+      if [[ -z "$2" ]]; then
+        print -u2 "work: --project requer um nome"
+        exit 1
+      fi
+      project_flag="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) print -u2 "work: flag desconhecida: $1 (veja work --help)"; exit 1 ;;
+    *) break ;;
+  esac
+done
+
+title="$1"
+[[ $# -gt 0 ]] && shift
+desc="$*"
+
+if [[ -z "$title" ]]; then
+  printf 'título: '
+  read -r title
+  if [[ -z "$title" ]]; then
+    print -u2 "work: título vazio, nada capturado"
+    exit 1
+  fi
+  printf 'descrição (enter p/ pular): '
+  read -r desc
+fi
+
+# Contexto: repo git atual → canonical key host/owner/repo (formato do Orca).
+repo_key=""
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  remote_url=$(git remote get-url origin 2>/dev/null)
+  if [[ -n "$remote_url" ]]; then
+    repo_key=$(print -r -- "$remote_url" |
+      sed -E 's#^(ssh://git@|git@|https?://)##; s#:#/#; s#/$##; s#\.git$##')
+  fi
+fi
+
+body="$desc"
+if [[ -n "$repo_key" ]]; then
+  [[ -n "$body" ]] && body+=$'\n\n'
+  # Backticks impedem o Linear de auto-linkificar a key (quebraria o parser do spawn).
+  body+="repo: \`$repo_key\`"
+fi
+
+# Projeto: --project sobrescreve; senão, inferido do repo (último segmento do
+# canonical key). `linear create --project` exige projeto existente com nome
+# exato, então valida antes via project list (match case-insensitive, usa o
+# nome exato retornado). Qualquer falha aqui vira aviso, nunca bloqueia a captura.
+project_want="${project_flag:-${repo_key##*/}}"
+project=""
+if [[ -n "$project_want" ]]; then
+  project=$(orca linear project list --query "$project_want" --json 2>/dev/null |
+    python3 -c '
+import json, sys
+want = sys.argv[1].casefold()
+try:
+    d = json.loads(sys.stdin.read(), strict=False)
+except Exception:
+    sys.exit(1)
+if not d.get("ok"):
+    sys.exit(1)
+for p in d.get("result", {}).get("projects", []):
+    if p.get("name", "").casefold() == want:
+        print(p["name"])
+        break
+' "$project_want" 2>/dev/null)
+  if [[ -z "$project" ]]; then
+    print -u2 "work: aviso — projeto '$project_want' não existe no Linear; criando sem projeto"
+  fi
+fi
+
+create_args=(--title "$title" --team "$TEAM" --state Backlog --json)
+[[ -n "$project" ]] && create_args+=(--project "$project")
+if [[ -n "$body" ]]; then
+  out=$(print -r -- "$body" | orca linear create "${create_args[@]}" --body-file - 2>&1)
+else
+  out=$(orca linear create "${create_args[@]}" 2>&1)
+fi
+rc=$?
+
+result=$(print -r -- "$out" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read(), strict=False)
+except Exception:
+    sys.exit(1)
+if not d.get("ok"):
+    sys.exit(1)
+issue = d.get("result", {}).get("issue", d.get("result", {}))
+print(issue.get("identifier", "?"), issue.get("url", ""))
+' 2>/dev/null)
+
+if [[ $rc -ne 0 || -z "$result" ]]; then
+  print -u2 "work: falha ao criar issue no Linear"
+  print -u2 -r -- "$out"
+  print -u2 "dica: runtime do Orca fora do ar? tente \`orca open\`"
+  (( popup )) && { print -n "qualquer tecla fecha…"; read -k 1 -s; }
+  exit 1
+fi
+
+proj_note="sem projeto"
+[[ -n "$project" ]] && proj_note="projeto: $project"
+print "✓ ${result% *} → Backlog · $proj_note${repo_key:+ · repo: $repo_key}"
+print "  ${result#* }"
+
+if (( popup )); then
+  print -n "qualquer tecla fecha…"
+  read -k 1 -s
+fi

@@ -1,0 +1,630 @@
+#!/bin/zsh
+# triage — triagem automática Backlog→Todo: interview assíncrono → spec → promoção.
+#
+# Uso:
+#   triage               tria todas as issues em Backlog do team
+#   triage --only KEY    tria somente a issue KEY
+#   triage --dry-run     avalia e relata o veredito, sem criar nem mutar nada
+#
+# Por issue (WOS-04/HEN-16): avalia clareza (goal/constraints/criteria — rubrica
+# deep-interview) com `claude -p` headless e age pelo veredito:
+#   ready      ambiguidade <= threshold → grava spec na description (via
+#              LINEAR_API_KEY; sem a key, spec vira comentário) e promove a Todo
+#   questions  perguntas viram gates da task "triagem KEY" → pendências no attn;
+#              responder: orca orchestration gate-resolve --id <gate> --resolution "…"
+#   decompose  escopo grande → propõe sub-issues em Backlog (herdam trailer repo:)
+#              em vez de promover; a issue-mãe segue em Backlog como épico
+#   escalate   não convergiu (>= TRIAGE_MAX_ROUNDS rodadas) → gate dedicado de
+#              refinamento manual; issue fica em Backlog
+#
+# Idempotência: gate pendente na task → issue aguardando humano, é pulada;
+# resposta de gate resolvido vira comentário na issue (contexto da próxima
+# rodada); issue que já tem sub-issues é pulada.
+#
+# Env: WORK_LINEAR_TEAM (HEN) · TRIAGE_THRESHOLD (0.20) · TRIAGE_MAX_ROUNDS (3)
+#      TRIAGE_MODEL (sonnet) · LINEAR_API_KEY (opcional — habilita o aceite
+#      "spec na description"; crie em linear.app/settings/api)
+
+set -o pipefail
+
+# $0 dentro de função vira o nome da função (FUNCTION_ARGZERO); capturar aqui.
+SELF="$0"
+
+TEAM="${WORK_LINEAR_TEAM:-HEN}"
+THRESHOLD="${TRIAGE_THRESHOLD:-0.20}"
+MAX_ROUNDS="${TRIAGE_MAX_ROUNDS:-3}"
+MODEL="${TRIAGE_MODEL:-sonnet}"
+
+usage() {
+  sed -n '2,8p' "$SELF" | sed 's/^# \{0,1\}//'
+}
+
+die() {
+  print -u2 "triage: $*"
+  exit 1
+}
+
+# Envelope JSON do orca com ok:true? (JSON pode ter control chars crus → strict=False)
+json_ok() {
+  RAW="$1" python3 - <<'PY'
+import json, os, sys
+try:
+    d = json.loads(os.environ["RAW"], strict=False)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("ok") else 1)
+PY
+}
+
+# Campo do veredito normalizado ($1): strings cruas, listas/objetos como JSON.
+vf() {
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+v = d.get(sys.argv[2], "")
+print(v if isinstance(v, str) else json.dumps(v, ensure_ascii=False))
+' "$verdict_file" "$1"
+}
+
+# ---------- args ----------
+dry_run=0
+only=""
+while (( $# )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --dry-run) dry_run=1 ;;
+    --only)
+      shift
+      [[ -n "$1" ]] || die "--only requer uma issue key (ex.: HEN-42)"
+      only="${(U)1}"
+      ;;
+    *) usage >&2; die "argumento desconhecido: $1" ;;
+  esac
+  shift
+done
+
+[[ "$MAX_ROUNDS" == <-> ]] || die "TRIAGE_MAX_ROUNDS inválido: $MAX_ROUNDS"
+THRESHOLD="$THRESHOLD" python3 -c 'import os; t = float(os.environ["THRESHOLD"]); assert 0 < t < 1' 2>/dev/null \
+  || die "TRIAGE_THRESHOLD inválido (fração 0..1): $THRESHOLD"
+command -v claude >/dev/null || die "claude CLI não encontrado — o assento da triagem é o Claude Code headless"
+
+state_dir=$(mktemp -d "${TMPDIR:-/tmp}/triage.XXXXXX") || die "mktemp falhou"
+trap 'rm -rf "$state_dir"' EXIT
+
+# ---------- estado atual: issues, tasks, gates, repos ----------
+issues_raw=$(orca linear list --filter open --team "$TEAM" --limit 100 --json 2>&1)
+json_ok "$issues_raw" || die "falha em \`orca linear list\` — runtime do Orca fora do ar? tente \`orca open\`"
+
+# Backlog ordenado por prioridade Linear (urgent→low, sem prioridade por último),
+# depois por key (FIFO aproximado) — mesma fila do linear-sync.
+backlog_lines=$(RAW="$issues_raw" TEAM="$TEAM" python3 - <<'PY'
+import json, os
+d = json.loads(os.environ["RAW"], strict=False)
+team = os.environ["TEAM"]
+rows = []
+for i in d.get("result", {}).get("issues", []):
+    if (i.get("state") or {}).get("name") != "Backlog":
+        continue
+    if (i.get("team") or {}).get("key") != team:
+        continue
+    p = i.get("priority") or 0
+    try:
+        num = int(i["identifier"].rsplit("-", 1)[-1])
+    except ValueError:
+        num = 10**9
+    rows.append((0 if p else 1, p, num, i["identifier"]))
+for _, _, _, key in sorted(rows):
+    print(key)
+PY
+)
+typeset -a backlog=( ${(f)backlog_lines} )
+
+tasks_raw=$(orca orchestration task-list --json 2>&1)
+json_ok "$tasks_raw" || die "falha em \`orca orchestration task-list\`"
+gates_raw=$(orca orchestration gate-list --json 2>&1)
+json_ok "$gates_raw" || die "falha em \`orca orchestration gate-list\`"
+
+# task "triagem KEY" → id (âncora das pendências de uma issue entre execuções)
+task_lines=$(RAW="$tasks_raw" python3 - <<'PY'
+import json, os
+d = json.loads(os.environ["RAW"], strict=False)
+for t in d.get("result", {}).get("tasks", []):
+    title = t.get("task_title") or ""
+    if title.startswith("triagem "):
+        print(title.split(" ", 1)[1] + "\t" + t["id"])
+PY
+)
+typeset -A task_id
+for line in ${(f)task_lines}; do
+  task_id[${line%%$'\t'*}]="${line#*$'\t'}"
+done
+
+repos_csv=$(orca repo list --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read(), strict=False)
+except Exception:
+    d = {}
+keys = []
+for r in d.get("result", {}).get("repos", []):
+    k = (r.get("gitRemoteIdentity") or {}).get("canonicalKey")
+    if k:
+        keys.append(k)
+print(",".join(keys))
+')
+
+print "triage · team $TEAM · threshold $THRESHOLD · max rodadas $MAX_ROUNDS · modelo $MODEL · em Backlog: ${#backlog[@]}"
+(( dry_run )) && print "(dry-run: avalia e relata, nada será criado nem mutado)"
+[[ -z "$LINEAR_API_KEY" ]] && print "⚠ sem LINEAR_API_KEY — spec aprovada vai de comentário, não de description (crie em linear.app/settings/api e exporte em ~/.credentials.sh)"
+
+# ---------- helpers de ação ----------
+
+# Garante task de orquestração "triagem KEY"; ecoa o id.
+# (roda em subshell via $(…) — o cache task_id é atualizado pelo chamador)
+ensure_task() {
+  local key="$1"
+  if [[ -n "${task_id[$key]}" ]]; then
+    print -r -- "${task_id[$key]}"
+    return 0
+  fi
+  local raw
+  raw=$(orca orchestration task-create --spec "triagem $key — interview assíncrono (WOS-04)" \
+    --task-title "triagem $key" --display-name "triagem $key" --json 2>&1)
+  json_ok "$raw" || return 1
+  RAW="$raw" python3 -c '
+import json, os
+d = json.loads(os.environ["RAW"], strict=False)
+print(d["result"]["task"]["id"])'
+}
+
+# Cria gate na task; ecoa o gate id.
+create_gate() {
+  local tid="$1" question="$2" raw
+  raw=$(orca orchestration gate-create --task "$tid" --question "$question" --json 2>&1)
+  json_ok "$raw" || return 1
+  RAW="$raw" python3 -c '
+import json, os
+d = json.loads(os.environ["RAW"], strict=False)
+print(d["result"]["gate"]["id"])'
+}
+
+# Grava description via API GraphQL do Linear (exige LINEAR_API_KEY).
+update_description() {
+  ISSUE_UUID="$1" NEW_DESC="$2" python3 - <<'PY'
+import json, os, sys, urllib.request
+payload = json.dumps({
+    "query": "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+    "variables": {"id": os.environ["ISSUE_UUID"], "input": {"description": os.environ["NEW_DESC"]}},
+}).encode()
+req = urllib.request.Request(
+    "https://api.linear.app/graphql", data=payload,
+    headers={"Content-Type": "application/json", "Authorization": os.environ["LINEAR_API_KEY"]})
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        d = json.load(r)
+except Exception as e:
+    print(f"issueUpdate: {e}", file=sys.stderr)
+    sys.exit(1)
+if d.get("errors"):
+    print(f"issueUpdate: {d['errors']}", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0 if (d.get("data") or {}).get("issueUpdate", {}).get("success") else 1)
+PY
+}
+
+# ---------- loop por issue ----------
+typeset -a promoted questioned decomposed escalated waiting skipped failed
+matched_only=0
+
+for key in "${backlog[@]}"; do
+  [[ -n "$only" && "$key" != "$only" ]] && continue
+  matched_only=1
+
+  issue_raw=$(orca linear issue "$key" --full --json 2>&1)
+  if ! json_ok "$issue_raw"; then
+    print "✗ $key · falha ao ler a issue"
+    failed+=("$key")
+    continue
+  fi
+
+  # Estado por issue: sub-issues? gates pendentes? respostas não consumidas?
+  # quantas rodadas de perguntas já houve?
+  gate_file="$state_dir/$key.gates.json"
+  RAW="$issue_raw" GATES="$gates_raw" TID="${task_id[$key]:-}" python3 - > "$gate_file" <<'PY'
+import json, os
+res = json.loads(os.environ["RAW"], strict=False)["result"]
+gates = json.loads(os.environ["GATES"], strict=False).get("result", {}).get("gates", [])
+tid = os.environ["TID"]
+comments = [c.get("body") or "" for c in res.get("comments", [])]
+blob = "\n".join(comments)
+out = {
+    "children": len(res.get("children", [])),
+    "asked": sum(1 for c in comments if c.startswith("## Triagem — rodada")),
+    "pending": 0,
+    "unconsumed": [],   # resolvidos ainda sem comentário na issue
+    "qa": [],           # histórico resolvido completo (contexto do interview)
+}
+for g in gates:
+    if not tid:
+        break
+    if g.get("task_id") != tid:
+        continue
+    if g.get("status") == "pending":
+        out["pending"] += 1
+    elif g.get("status") == "resolved":
+        qa = {"id": g["id"], "q": g.get("question") or "", "r": g.get("resolution") or ""}
+        out["qa"].append(qa)
+        # marcador distinto do "— gate `id`" que o comentário de rodada usa
+        if f"resposta gate `{g['id']}`" not in blob:
+            out["unconsumed"].append(qa)
+print(json.dumps(out, ensure_ascii=False))
+PY
+  [[ -s "$gate_file" ]] || { print "✗ $key · falha ao montar estado dos gates"; failed+=("$key"); continue; }
+
+  n_children=$(python3 -c "import json;print(json.load(open('$gate_file'))['children'])")
+  n_pending=$(python3 -c "import json;print(json.load(open('$gate_file'))['pending'])")
+  asked=$(python3 -c "import json;print(json.load(open('$gate_file'))['asked'])")
+
+  if (( n_children > 0 )); then
+    print "= $key · já decomposta em $n_children sub-issue(s) — promova/cancele a mãe manualmente"
+    skipped+=("$key")
+    continue
+  fi
+  if (( n_pending > 0 )); then
+    print "• $key · aguardando humano: $n_pending gate(s) pendente(s) no attn"
+    waiting+=("$key")
+    continue
+  fi
+
+  # Consome respostas de gates resolvidos → comentário na issue (auditoria +
+  # contexto persistente da próxima rodada).
+  n_unconsumed=$(python3 -c "import json;print(len(json.load(open('$gate_file'))['unconsumed']))")
+  if (( n_unconsumed > 0 && ! dry_run )); then
+    for (( i = 0; i < n_unconsumed; i++ )); do
+      GF="$gate_file" IDX=$i python3 - <<'PY' |
+import json, os
+qa = json.load(open(os.environ["GF"]))["unconsumed"][int(os.environ["IDX"])]
+print(f"**Pergunta (triagem):** {qa['q']}\n\n**Resposta:** {qa['r']}\n\nresposta gate `{qa['id']}`")
+PY
+        orca linear comment add "$key" --body-file - --json >/dev/null 2>&1 ||
+        print "  ⚠ $key · falha ao registrar resposta de gate como comentário"
+    done
+  fi
+
+  # ---------- interview headless ----------
+  prompt=$(RAW="$issue_raw" GATEST="$(cat "$gate_file")" REPOS="$repos_csv" \
+    THRESHOLD="$THRESHOLD" python3 - <<'PY'
+import json, os
+res = json.loads(os.environ["RAW"], strict=False)["result"]
+issue = res["issue"]
+st = json.loads(os.environ["GATEST"])
+threshold = os.environ["THRESHOLD"]
+repos = os.environ["REPOS"]
+
+parts = []
+parts.append(
+    "Você é o avaliador de triagem de issues do Linear (backlog pessoal). Sua única "
+    "função: avaliar a clareza da issue abaixo e responder com um JSON de veredito. "
+    "Isto é um pipeline automatizado headless — a saída será parseada por script; "
+    "responda SOMENTE com o objeto JSON, sem cerca de código, sem texto extra.")
+parts.append(f"# Issue {issue['identifier']} — {(issue.get('state') or {}).get('name')}")
+parts.append(f"Título: {issue.get('title') or '(sem título)'}")
+parts.append("Description:\n" + (issue.get("description") or "(vazia)"))
+
+comments = res.get("comments", [])
+if comments:
+    cs = "\n\n".join(f"[{i+1}] {c.get('body') or ''}" for i, c in enumerate(comments))
+    parts.append("# Comentários da issue (histórico, inclui rodadas anteriores da triagem)\n" + cs)
+if st["qa"]:
+    qas = "\n\n".join(f"P: {x['q']}\nR: {x['r']}" for x in st["qa"])
+    parts.append("# Respostas do humano às perguntas da triagem (fonte primária de clareza)\n" + qas)
+
+parts.append(f"""# Rubrica (deep-interview)
+Avalie 3 dimensões de 0.0 a 1.0, com base em TUDO acima (respostas do humano contam tanto quanto a description):
+- goal: o que exatamente deve acontecer/mudar quando estiver pronto
+- constraints: limites e fronteiras (onde vive, o que não pode quebrar, o que está fora de escopo)
+- criteria: como verificar que funcionou (aceite testável)
+ambiguidade = 1 - (goal*0.40 + constraints*0.30 + criteria*0.30). Threshold: {threshold}.""")
+
+parts.append(f"""# Veredito (escolha exatamente um)
+- "ready": ambiguidade <= {threshold} → inclua "spec": a description refinada em markdown, concisa, que um agente implementador executa sozinho. Estrutura: contexto/problema em 1-3 frases; seção "**Aceite**" com critérios numerados e testáveis; preserve qualquer linha `repo: ...` (com backticks no valor) da description original como última linha — é o roteamento do spawn, sem os backticks o parser quebra.
+- "questions": falta clareza → inclua "questions": 1 a 3 perguntas (a mais valiosa primeiro), cada uma de UMA linha, auto-contida (aparece isolada num painel de pendências) e respondível de forma assíncrona. Mire a dimensão de menor score. Se a description não tem linha `repo: ...` e o trabalho envolve código, uma das perguntas deve pedir o repo alvo (registrados: {repos or '(nenhum)'}).
+- "decompose": o goal é claro, mas o escopo excede ~1 dia de trabalho focado ou mistura entregáveis independentes → inclua "subissues": 2 a 5 objetos {{"title", "body"}}; cada body é uma mini-spec independente (contexto + **Aceite** numerado) e termina com a linha `repo: ...` herdada da issue-mãe quando existir.
+- "escalate": a definição não converge por processo assíncrono (decisão de gosto/estratégia que só o dono resolve, contradições entre respostas) → inclua "reason" (uma frase).""")
+
+parts.append("""# Formato da resposta (JSON puro, todos os textos em pt-BR)
+{"scores": {"goal": 0.0, "constraints": 0.0, "criteria": 0.0}, "verdict": "ready|questions|decompose|escalate", "reason": "uma frase justificando", "spec": "...", "questions": ["..."], "subissues": [{"title": "...", "body": "..."}]}
+Inclua somente os campos exigidos pelo veredito escolhido (scores e reason sempre).""")
+
+print("\n\n".join(parts))
+PY
+)
+  if [[ -z "$prompt" ]]; then
+    print "✗ $key · falha ao montar o prompt do interview"
+    failed+=("$key")
+    continue
+  fi
+
+  # cwd neutro: sem hooks/CLAUDE.md de repo interferindo no assento headless
+  claude_raw=$(print -r -- "$prompt" |
+    ( cd "${TMPDIR:-/tmp}" && claude -p --output-format json --tools "" \
+        --model "$MODEL" --no-session-persistence ) 2>&1)
+
+  verdict_file="$state_dir/$key.verdict.json"
+  RAW="$claude_raw" THRESHOLD="$THRESHOLD" ASKED="$asked" MAXR="$MAX_ROUNDS" \
+    python3 - > "$verdict_file" <<'PY'
+import json, os, re, sys
+try:
+    wrapper = json.loads(os.environ["RAW"], strict=False)
+    text = wrapper["result"]
+    if wrapper.get("is_error"):
+        raise ValueError(f"claude is_error: {text[:200]}")
+except Exception as e:
+    print(f"saída do claude não parseável: {e}", file=sys.stderr)
+    sys.exit(1)
+m = re.search(r"\{.*\}", text, re.S)
+if not m:
+    print(f"veredito sem JSON: {text[:200]}", file=sys.stderr)
+    sys.exit(1)
+try:
+    v = json.loads(m.group(0), strict=False)
+except Exception as e:
+    print(f"JSON do veredito inválido: {e}", file=sys.stderr)
+    sys.exit(1)
+
+s = v.get("scores") or {}
+try:
+    goal, cons, crit = (max(0.0, min(1.0, float(s[k]))) for k in ("goal", "constraints", "criteria"))
+except Exception:
+    print("scores ausentes/inválidos no veredito", file=sys.stderr)
+    sys.exit(1)
+# não confiar na aritmética do modelo: recalcular a ambiguidade da rubrica
+amb = 1 - (goal * 0.40 + cons * 0.30 + crit * 0.30)
+threshold = float(os.environ["THRESHOLD"])
+asked, maxr = int(os.environ["ASKED"]), int(os.environ["MAXR"])
+
+verdict = v.get("verdict")
+reason = (v.get("reason") or "").strip()
+questions = [q.strip() for q in (v.get("questions") or []) if isinstance(q, str) and q.strip()][:3]
+subissues = [x for x in (v.get("subissues") or [])
+             if isinstance(x, dict) and (x.get("title") or "").strip() and (x.get("body") or "").strip()]
+spec = (v.get("spec") or "").strip()
+downgraded = ""
+
+if verdict == "ready" and amb > threshold:
+    verdict, downgraded = ("questions", "ready") if questions else ("escalate", "ready")
+    reason = reason or "veredito ready acima do threshold recalculado"
+if verdict == "ready" and not spec:
+    verdict, downgraded = "escalate", "ready"
+    reason = "veredito ready sem spec"
+if verdict == "questions" and not questions:
+    verdict, downgraded = "escalate", "questions"
+    reason = "veredito questions sem perguntas"
+if verdict == "decompose" and len(subissues) < 2:
+    verdict, downgraded = "escalate", "decompose"
+    reason = "decomposição inválida (menos de 2 sub-issues)"
+# aceite 5: rodadas esgotadas sem convergir → refinamento manual
+if verdict == "questions" and asked >= maxr:
+    verdict, downgraded = "escalate", "questions"
+    reason = f"não convergiu após {asked} rodada(s) de perguntas"
+if verdict not in ("ready", "questions", "decompose", "escalate"):
+    print(f"veredito desconhecido: {verdict}", file=sys.stderr)
+    sys.exit(1)
+
+print(json.dumps({
+    "verdict": verdict, "downgraded_from": downgraded, "reason": reason,
+    "ambiguity_pct": round(amb * 100), "threshold_pct": round(threshold * 100),
+    "goal": goal, "constraints": cons, "criteria": crit,
+    "spec": spec, "questions": questions, "subissues": subissues,
+}, ensure_ascii=False))
+PY
+  if [[ ! -s "$verdict_file" ]]; then
+    print "✗ $key · interview falhou:"
+    print -r -- "$claude_raw" | head -3
+    failed+=("$key")
+    continue
+  fi
+
+  verdict=$(vf verdict)
+  amb=$(vf ambiguity_pct)
+  reason=$(vf reason)
+  scores="goal $(vf goal) · constraints $(vf constraints) · criteria $(vf criteria)"
+  round_n=$(( asked + 1 ))
+
+  if (( dry_run )); then
+    print "→ $key · [dry-run] $verdict · ambiguidade ${amb}% · $scores"
+    print "    $reason"
+    case "$verdict" in
+      ready)
+        promoted+=("$key") ;;
+      questions)
+        python3 -c "
+import json
+for q in json.load(open('$verdict_file'))['questions']:
+    print('    ? ' + q)"
+        questioned+=("$key") ;;
+      decompose)
+        python3 -c "
+import json
+for s in json.load(open('$verdict_file'))['subissues']:
+    print('    + ' + s['title'])"
+        decomposed+=("$key") ;;
+      escalate)
+        escalated+=("$key") ;;
+    esac
+    continue
+  fi
+
+  case "$verdict" in
+
+  ready)
+    spec=$(vf spec)
+    # rede de segurança: trailer repo: da description original não pode sumir
+    spec=$(SPEC="$spec" RAW="$issue_raw" python3 - <<'PY'
+import json, os, re
+spec = os.environ["SPEC"]
+desc = json.loads(os.environ["RAW"], strict=False)["result"]["issue"].get("description") or ""
+m = re.search(r"repo: `[^`]+`", desc)
+if m and m.group(0) not in spec:
+    spec = spec.rstrip() + "\n\n" + m.group(0)
+print(spec)
+PY
+)
+    issue_uuid=$(RAW="$issue_raw" python3 -c '
+import json, os
+print(json.loads(os.environ["RAW"], strict=False)["result"]["issue"]["id"])')
+    spec_where="description"
+    if [[ -n "$LINEAR_API_KEY" ]]; then
+      update_description "$issue_uuid" "$spec" || {
+        print "  ⚠ $key · issueUpdate falhou — gravando spec como comentário"
+        spec_where="comentário"
+      }
+    else
+      spec_where="comentário"
+    fi
+    if [[ "$spec_where" == "comentário" ]]; then
+      { print "## Spec refinada (triagem) — cole na description"; print ""; print -r -- "$spec"; } |
+        orca linear comment add "$key" --body-file - --json >/dev/null 2>&1
+    fi
+    print -r -- "## Triagem — promovida a Todo
+
+Ambiguidade final ${amb}% ≤ $(vf threshold_pct)% ($scores). Spec gravada em: $spec_where. $reason" |
+      orca linear comment add "$key" --body-file - --json >/dev/null 2>&1
+    st_raw=$(orca linear status set "$key" --to "Todo" --json 2>&1)
+    if ! json_ok "$st_raw"; then
+      print "✗ $key · spec gravada, mas falhou ao mover p/ Todo — mova manualmente"
+      failed+=("$key")
+      continue
+    fi
+    [[ -n "${task_id[$key]}" ]] &&
+      orca orchestration task-update --id "${task_id[$key]}" --status completed --json >/dev/null 2>&1
+    print "✓ $key · ambiguidade ${amb}% → spec em $spec_where · Todo"
+    promoted+=("$key")
+    ;;
+
+  questions)
+    tid=$(ensure_task "$key")
+    if [[ -z "$tid" ]]; then
+      print "✗ $key · falha ao criar task de orquestração"
+      failed+=("$key")
+      continue
+    fi
+    task_id[$key]="$tid"
+    n_q=$(python3 -c "import json;print(len(json.load(open('$verdict_file'))['questions']))")
+    typeset -a gate_ids=() gate_qs=()
+    for (( i = 0; i < n_q; i++ )); do
+      q=$(python3 -c "import json;print(json.load(open('$verdict_file'))['questions'][$i])")
+      gid=$(create_gate "$tid" "[$key] $q")
+      if [[ -n "$gid" ]]; then
+        gate_ids+=("$gid")
+        gate_qs+=("$q")
+      else
+        print "  ⚠ $key · pergunta não virou gate: $q"
+      fi
+    done
+    if (( ${#gate_ids[@]} == 0 )); then
+      print "✗ $key · nenhuma pergunta virou gate"
+      failed+=("$key")
+      continue
+    fi
+    { print "## Triagem — rodada $round_n"
+      print ""
+      print "Ambiguidade ${amb}% (threshold $(vf threshold_pct)%) · $scores. $reason"
+      print ""
+      print "Perguntas pendentes no painel de atenção (\`attn\`):"
+      for (( i = 1; i <= ${#gate_ids[@]}; i++ )); do
+        print "$i. ${gate_qs[$i]} — gate \`${gate_ids[$i]}\`"
+      done
+      print ""
+      print 'Responder: `orca orchestration gate-resolve --id <gate> --resolution "…"` — a resposta entra na próxima rodada da triagem.'
+    } | orca linear comment add "$key" --body-file - --json >/dev/null 2>&1
+    print "? $key · rodada $round_n · ambiguidade ${amb}% · ${#gate_ids[@]} pergunta(s) no attn"
+    questioned+=("$key")
+    ;;
+
+  decompose)
+    n_sub=$(python3 -c "import json;print(len(json.load(open('$verdict_file'))['subissues']))")
+    typeset -a child_keys=()
+    for (( i = 0; i < n_sub; i++ )); do
+      title=$(python3 -c "import json;print(json.load(open('$verdict_file'))['subissues'][$i]['title'])")
+      body=$(VF="$verdict_file" IDX=$i RAW="$issue_raw" python3 - <<'PY'
+import json, os, re
+body = json.load(open(os.environ["VF"]))["subissues"][int(os.environ["IDX"])]["body"]
+desc = json.loads(os.environ["RAW"], strict=False)["result"]["issue"].get("description") or ""
+m = re.search(r"repo: `[^`]+`", desc)
+if m and m.group(0) not in body:
+    body = body.rstrip() + "\n\n" + m.group(0)
+print(body)
+PY
+)
+      create_raw=$(print -r -- "$body" | orca linear create --title "$title" --team "$TEAM" \
+        --state Backlog --parent "$key" --body-file - --json 2>&1)
+      if json_ok "$create_raw"; then
+        child=$(RAW="$create_raw" python3 -c '
+import json, os
+d = json.loads(os.environ["RAW"], strict=False)
+issue = d.get("result", {}).get("issue", d.get("result", {}))
+print(issue.get("identifier", "?"))')
+        child_keys+=("$child")
+        print "  + $key → $child · $title"
+      else
+        print "  ✗ $key · falha ao criar sub-issue: $title"
+      fi
+    done
+    if (( ${#child_keys[@]} == 0 )); then
+      print "✗ $key · decomposição não criou nenhuma sub-issue"
+      failed+=("$key")
+      continue
+    fi
+    { print "## Triagem — decomposição proposta"
+      print ""
+      print "Escopo excede uma issue executável ($reason). Criadas em Backlog — cada uma passa pela triagem normalmente:"
+      for c in "${child_keys[@]}"; do print -r -- "- $c"; done
+      print ""
+      print "Esta issue segue em Backlog como épico; promova/cancele conforme fizer sentido."
+    } | orca linear comment add "$key" --body-file - --json >/dev/null 2>&1
+    [[ -n "${task_id[$key]}" ]] &&
+      orca orchestration task-update --id "${task_id[$key]}" --status completed --json >/dev/null 2>&1
+    print "⑃ $key · decomposta em ${#child_keys[@]} sub-issue(s) — segue em Backlog"
+    decomposed+=("$key")
+    ;;
+
+  escalate)
+    tid=$(ensure_task "$key")
+    if [[ -z "$tid" ]]; then
+      print "✗ $key · falha ao criar task de orquestração"
+      failed+=("$key")
+      continue
+    fi
+    task_id[$key]="$tid"
+    gid=$(create_gate "$tid" "[$key] refinamento manual: $reason — refine a description e resolva este gate; a triagem reavalia")
+    if [[ -z "$gid" ]]; then
+      print "✗ $key · falha ao criar gate de refinamento manual"
+      failed+=("$key")
+      continue
+    fi
+    print -r -- "## Triagem — escalada para refinamento manual
+
+$reason (ambiguidade ${amb}%, $scores, após $asked rodada(s) de perguntas).
+
+Pendência dedicada no \`attn\`: gate \`$gid\`. Refine a description à mão e resolva o gate — a triagem então reavalia." |
+      orca linear comment add "$key" --body-file - --json >/dev/null 2>&1
+    print "⚑ $key · escalada p/ refinamento manual (gate $gid no attn)"
+    escalated+=("$key")
+    ;;
+  esac
+done
+
+if [[ -n "$only" && $matched_only -eq 0 ]]; then
+  die "$only não está em Backlog no team $TEAM — gate: a triagem só avalia Backlog"
+fi
+
+suffix=""
+(( dry_run )) && suffix=" (dry-run)"
+print ""
+print "resumo$suffix: ${#promoted[@]} promovida(s) · ${#questioned[@]} c/ perguntas · ${#decomposed[@]} decomposta(s) · ${#escalated[@]} escalada(s) · ${#waiting[@]} aguardando humano · ${#skipped[@]} já decomposta(s) · ${#failed[@]} falha(s)"
+
+# aguardando-humano e já-decomposta são estados idempotentes válidos; só
+# falha real derruba o exit code.
+(( ${#failed[@]} > 0 )) && exit 1
+exit 0

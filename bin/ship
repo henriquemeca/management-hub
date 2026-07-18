@@ -1,0 +1,158 @@
+#!/bin/zsh
+# ship — comando determinístico de fechamento: fecha issue, worktree e task Orca.
+#
+# Uso:
+#   ship HEN-XX           fecha a issue: exige PR MERGED, marca Done, remove a worktree
+#   ship HEN-XX --force   pula o gate de PR MERGED (exceção deliberada)
+#
+# Decisão da sessão HEN-33: comando, não skill — sequência 100% mecânica, sem
+# julgamento de LLM. "done" literal não dá: é palavra reservada do zsh.
+#
+# Fluxo:
+#   1. orca linear issue HEN-XX --attachments --json → acha o PR anexado
+#   2. gh pr view <url> --json state → exige MERGED; senão aborta (--force pula)
+#   3. orca linear status set HEN-XX --to Done
+#   4. orca worktree list --json → acha a worktree vinculada (linkedLinearIssue)
+#   5. orca worktree rm --worktree path:<path> --run-hooks → encerra worktree +
+#      task/card no Orca de uma vez (hooks de archive do orca.yaml rodam)
+#
+# Guard-rails (ifs, não julgamento — nenhum tem --force):
+#   - recusa worktree com mudanças não commitadas (git status --porcelain sujo)
+#   - recusa worktree sem upstream configurado ou com commits não pushados
+#   - recusa rodar de dentro da própria worktree (não se auto-remover)
+#
+# Idempotente: issue já Done vira no-op no passo 1-3; worktree já removida (ou
+# nunca existiu) vira no-op no passo 4-5. Re-rodar é sempre seguro.
+#
+# Chamadores previstos: Henrique no terminal pós-merge; linear-sync num futuro
+# poll de merge; agentes coordenadores. Agente executor NUNCA chama ship — está
+# dentro da worktree que seria removida; ele para em In Review.
+
+set -o pipefail
+
+SELF="$0"
+usage() {
+  sed -n '2,/^$/p' "$SELF" | sed 's/^# \{0,1\}//'
+}
+
+die() {
+  print -u2 "ship: $*"
+  exit 1
+}
+
+json_ok() {
+  RAW="$1" python3 - <<'PY'
+import json, os, sys
+try:
+    d = json.loads(os.environ["RAW"], strict=False)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("ok") else 1)
+PY
+}
+
+# ---------- args ----------
+force=0
+key=""
+while (( $# )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --force) force=1 ;;
+    -*) die "flag desconhecida: $1 (veja ship --help)" ;;
+    *)
+      [[ -n "$key" ]] && die "argumento inesperado: $1"
+      key="${(U)1}"
+      ;;
+  esac
+  shift
+done
+[[ -n "$key" ]] || { usage; die "uso: ship HEN-XX" }
+
+# ---------- 1-3: issue → PR MERGED → Done ----------
+issue_raw=$(orca linear issue "$key" --attachments --json 2>&1)
+json_ok "$issue_raw" || die "falha ao ler a issue $key — runtime do Orca fora do ar? tente \`orca open\`"
+
+state_name=$(RAW="$issue_raw" python3 -c '
+import json, os
+d = json.loads(os.environ["RAW"], strict=False)
+print((d["result"]["issue"].get("state") or {}).get("name", ""))
+')
+[[ -n "$state_name" ]] || die "issue $key não encontrada"
+
+if [[ "$state_name" == "Done" ]]; then
+  print "= $key · já está Done — pulando passos 1-3"
+else
+  pr_url=$(RAW="$issue_raw" python3 -c '
+import json, os
+d = json.loads(os.environ["RAW"], strict=False)
+for a in d["result"].get("attachments", []):
+    url = a.get("url") or ""
+    if "/pull/" in url:
+        print(url)
+        break
+')
+  [[ -n "$pr_url" ]] || die "nenhum PR anexado à issue $key — anexe com \`orca linear attach\` antes de rodar ship"
+
+  if (( force )); then
+    print "⚠ $key · --force: pulando o gate de PR MERGED (PR: $pr_url)"
+  else
+    pr_raw=$(gh pr view "$pr_url" --json state 2>&1)
+    [[ $? -eq 0 ]] || die "falha ao consultar o PR via gh: $pr_raw"
+    pr_state=$(print -r -- "$pr_raw" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("state", ""))' 2>/dev/null)
+    [[ "$pr_state" == "MERGED" ]] || die "PR $pr_url não está MERGED (estado: ${pr_state:-desconhecido}) — use --force para forçar exceção"
+  fi
+
+  st_raw=$(orca linear status set "$key" --to Done --json 2>&1)
+  json_ok "$st_raw" || die "falha ao mover $key para Done: $st_raw"
+  print "✓ $key → Done"
+fi
+
+# ---------- 4: acha a worktree vinculada ----------
+wt_raw=$(orca worktree list --json 2>&1)
+json_ok "$wt_raw" || die "falha em \`orca worktree list\`"
+
+wt_path=$(RAW="$wt_raw" KEY="$key" python3 -c '
+import json, os
+d = json.loads(os.environ["RAW"], strict=False)
+key = os.environ["KEY"]
+for w in d["result"].get("worktrees", []):
+    if w.get("isArchived"):
+        continue
+    if w.get("linkedLinearIssue") == key:
+        print(w.get("path", ""))
+        break
+')
+
+if [[ -z "$wt_path" ]]; then
+  print "= $key · nenhuma worktree vinculada ativa — nada a remover"
+  exit 0
+fi
+
+# ---------- guard-rails ----------
+cur_raw=$(orca worktree current --json 2>&1)
+if json_ok "$cur_raw"; then
+  cur_path=$(RAW="$cur_raw" python3 -c '
+import json, os
+d = json.loads(os.environ["RAW"], strict=False)
+print(d["result"].get("worktree", {}).get("path", ""))
+')
+  [[ "$cur_path" == "$wt_path" ]] &&
+    die "não posso remover a worktree em que estou rodando ($wt_path) — rode ship de fora dela"
+fi
+
+dirty=$(git -C "$wt_path" status --porcelain 2>&1)
+[[ -n "$dirty" ]] &&
+  die "worktree $wt_path tem mudanças não commitadas — commit ou descarte antes de rodar ship:"$'\n'"$dirty"
+
+upstream=$(git -C "$wt_path" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>&1)
+if [[ $? -ne 0 ]]; then
+  die "worktree $wt_path sem branch upstream configurado — dê push antes de rodar ship"
+fi
+ahead=$(git -C "$wt_path" rev-list --count '@{u}..HEAD' 2>&1)
+[[ "$ahead" == <-> && "$ahead" -gt 0 ]] &&
+  die "worktree $wt_path tem $ahead commit(s) não pushado(s) — dê push antes de rodar ship"
+
+# ---------- 5: remove worktree + task/card Orca ----------
+rm_raw=$(orca worktree rm --worktree "path:$wt_path" --run-hooks --json 2>&1)
+json_ok "$rm_raw" || die "falha ao remover a worktree $wt_path: $rm_raw"
+print "✓ $key · worktree $wt_path removida (+ task/card Orca encerrados)"
