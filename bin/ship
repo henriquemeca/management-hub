@@ -3,7 +3,8 @@
 #
 # Uso:
 #   ship HEN-XX           fecha a issue: exige PR MERGED, marca Done, remove a worktree
-#   ship HEN-XX --force   pula o gate de PR MERGED e repassa --force ao workmux remove
+#   ship HEN-XX --force   pula o gate de PR MERGED (a remoção da worktree é
+#                         sempre --force no workmux — os guard-rails do ship são o gate)
 #
 # Decisão da sessão HEN-33: comando, não skill — sequência 100% mecânica, sem
 # julgamento de LLM. "done" literal não dá: é palavra reservada do zsh.
@@ -177,9 +178,10 @@ ahead=$(git -C "$wt_path" rev-list --count '@{u}..HEAD' 2>&1)
   die "worktree $wt_path tem $ahead commit(s) não pushado(s) — dê push antes de rodar ship"
 
 # ---------- 5: remove worktree + janela tmux + branch ----------
-rm_args=("$slug")
-(( force )) && rm_args+=(--force)
-if (cd "$repo_path" && workmux remove "${rm_args[@]}"); then
+# Sempre --force no workmux: os guard-rails do ship (worktree limpa, pushed,
+# não-self) JÁ passaram, e o prompt interativo do workmux retorna exit 0 ao
+# abortar — headless viraria falso sucesso.
+if (cd "$repo_path" && workmux remove "$slug" --force); then
   print "✓ $key · worktree $wt_path removida (worktree + janela tmux + branch local)"
 else
   die "falha ao remover a worktree $wt_path — veja a saída do workmux acima"

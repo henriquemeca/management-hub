@@ -12,7 +12,9 @@
 STORE="${WORK_OS_STATE:-$HOME/.local/state/work-os}/agents.jsonl"
 mkdir -p "${STORE:h}" 2>/dev/null
 
-EVENT="${1:-unknown}" STORE="$STORE" python3 -c '
+# $PPID do zsh = o processo do agente (claude) — é ele que os leitores testam
+# com kill -0; os.getppid() no python daria o pid deste script, que morre já.
+EVENT="${1:-unknown}" STORE="$STORE" AGENT_PID="$PPID" python3 -c '
 import json, os, sys, time
 try:
     payload = json.load(sys.stdin)
@@ -23,7 +25,7 @@ line = {
     "event": os.environ.get("EVENT", "unknown"),
     "cwd": payload.get("cwd") or os.getcwd(),
     "session_id": payload.get("session_id", ""),
-    "pid": os.getppid(),
+    "pid": int(os.environ.get("AGENT_PID", "0") or 0),
 }
 with open(os.environ["STORE"], "a") as f:
     f.write(json.dumps(line) + "\n")

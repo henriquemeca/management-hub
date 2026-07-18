@@ -19,7 +19,9 @@ set -o pipefail
 [[ -z "$LINEAR_API_KEY" && -f ~/.credentials.sh ]] && source ~/.credentials.sh
 [[ -n "$LINEAR_API_KEY" ]] || { print -u2 "linear-gql: LINEAR_API_KEY ausente"; exit 1 }
 
-exec python3 - "$@" <<'PY'
+# Programa via -c, NUNCA via stdin: --body-file - lê o stdin real do caller
+# (com `python3 - <<PY` o heredoc consome o stdin e todo body chegaria vazio).
+PROG=$(cat <<'PY'
 import json, os, sys, urllib.request
 
 API = "https://api.linear.app/graphql"
@@ -175,3 +177,5 @@ elif cmd == "project-list":
 else:
     die(f"subcomando desconhecido: {cmd}")
 PY
+)
+exec python3 -c "$PROG" "$@"
