@@ -22,6 +22,8 @@
 #   wos sync [...]       → linear-sync (fila→spawn em lote)
 #   wos ship [...]       → ship      (fechamento: Done + worktree)
 #   wos attn [...]       → attn      (painel de pendências puro)
+#   wos doctor           checagem de saúde das fundações (auth, state,
+#                        PATH, hooks, symlinks) — exit 1 se algo falhar
 #
 # Política default de modelo/effort:
 #   sonnet/medium   rotina — task bem especificada, bugfix com repro
@@ -367,6 +369,124 @@ cmd_go() {
   fi
 }
 
+# ---------- wos doctor ----------
+# Checagens das fundações do ambiente (HEN-85) — cada uma imprime uma linha
+# ✓/✗; exit 1 se qualquer uma falhar. Não corrige nada, só diagnostica.
+typeset -a DOCTOR_SCRIPTS=(work attn wos triage linear-sync ship linear-gql gates wos-hook)
+
+doctor_ok()  { print -r -- "✓ $1 · $2" }
+doctor_fail() { print -r -- "✗ $1 — $2" }
+
+cmd_doctor() {
+  local failed=0
+  local state_dir="${WORK_OS_STATE:-$HOME/.local/state/work-os}"
+
+  # 1. LINEAR_API_KEY presente e linear-gql list executa com sucesso
+  local key="$LINEAR_API_KEY"
+  [[ -z "$key" && -f ~/.credentials.sh ]] &&
+    key=$(zsh -c 'source ~/.credentials.sh 2>/dev/null; print -r -- "$LINEAR_API_KEY"')
+  if [[ -z "$key" ]]; then
+    doctor_fail "LINEAR_API_KEY" "defina no env ou em ~/.credentials.sh"
+    failed=1
+  elif "$(sibling linear-gql)" list --limit 1 >/dev/null 2>&1; then
+    doctor_ok "LINEAR_API_KEY" "presente, linear-gql list ok"
+  else
+    doctor_fail "linear-gql list" "falhou com a API key atual (chave inválida? rede fora?)"
+    failed=1
+  fi
+
+  # 2. repos.json existe e é JSON válido
+  local repos_json="$state_dir/repos.json"
+  if [[ -f "$repos_json" ]] &&
+     python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$repos_json" >/dev/null 2>&1; then
+    doctor_ok "repos.json" "$repos_json válido"
+  else
+    doctor_fail "repos.json" "ausente ou JSON inválido em $repos_json"
+    failed=1
+  fi
+
+  # 3. workmux no PATH e config global legível
+  if command -v workmux >/dev/null 2>&1; then
+    if [[ -r ~/.config/workmux/config.yaml ]]; then
+      doctor_ok "workmux" "no PATH, ~/.config/workmux/config.yaml legível"
+    else
+      doctor_fail "workmux config" "~/.config/workmux/config.yaml ausente ou ilegível"
+      failed=1
+    fi
+  else
+    doctor_fail "workmux" "não encontrado no PATH"
+    failed=1
+  fi
+
+  # 4. tmux acessível
+  if command -v tmux >/dev/null 2>&1 && tmux -V >/dev/null 2>&1; then
+    doctor_ok "tmux" "$(tmux -V)"
+  else
+    doctor_fail "tmux" "não encontrado ou inacessível no PATH"
+    failed=1
+  fi
+
+  # 5. hooks do wos-hook registrados em ~/.claude/settings.json
+  if grep -q 'wos-hook' ~/.claude/settings.json 2>/dev/null; then
+    doctor_ok "hooks wos-hook" "registrados em ~/.claude/settings.json"
+  else
+    doctor_fail "hooks wos-hook" "não encontrados em ~/.claude/settings.json (ver dotfiles .claude/settings.json)"
+    failed=1
+  fi
+
+  # 6. gates.jsonl e agents.jsonl graváveis
+  mkdir -p "$state_dir" 2>/dev/null
+  local gates_file="$state_dir/gates.jsonl" agents_file="$state_dir/agents.jsonl"
+  touch "$gates_file" "$agents_file" 2>/dev/null
+  if [[ -w "$gates_file" && -w "$agents_file" ]]; then
+    doctor_ok "gates/agents.jsonl" "graváveis em $state_dir"
+  else
+    doctor_fail "gates/agents.jsonl" "não graváveis em $state_dir (checar permissões)"
+    failed=1
+  fi
+
+  # 7. symlinks em ~/.local/bin apontam para o checkout canônico (não worktree)
+  local bin_dir="$HOME/.local/bin"
+  local canonical=""
+  if [[ -f "$repos_json" ]]; then
+    canonical=$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for k, v in d.items():
+    if k.endswith("management-hub"):
+        print(v)
+        break
+' "$repos_json")
+  fi
+  if [[ -z "$canonical" ]]; then
+    doctor_fail "symlinks ~/.local/bin" "sem entrada management-hub em $repos_json — não dá para conferir o alvo canônico"
+    failed=1
+  else
+    canonical="${canonical:A}"
+    local canonical_bin="$canonical/bin"
+    local -a bad=()
+    local s link real real_dir
+    for s in "${DOCTOR_SCRIPTS[@]}"; do
+      link="$bin_dir/$s"
+      [[ -L "$link" ]] || continue
+      real="${link:A}"
+      real_dir="${real:h}"
+      [[ "$real_dir" == "$canonical_bin" ]] || bad+=("$s → $real_dir")
+    done
+    if (( ${#bad[@]} )); then
+      doctor_fail "symlinks ~/.local/bin" "fora do checkout canônico ($canonical_bin): ${(j:, :)bad} — rode 'make link' a partir do checkout canônico"
+      failed=1
+    else
+      doctor_ok "symlinks ~/.local/bin" "apontam para o checkout canônico ($canonical_bin)"
+    fi
+  fi
+
+  return $failed
+}
+
 # ---------- interativo (default): mesa única em loop ----------
 pause_panel() {
   print
@@ -499,6 +619,7 @@ case "$1" in
   sync)         shift; exec "$(sibling linear-sync)" "$@" ;;
   ship)         shift; exec "$(sibling ship)" "$@" ;;
   attn)         shift; exec "$(sibling attn)" "$@" ;;
+  doctor)       shift; cmd_doctor "$@"; exit $? ;;
   "")           cmd_fzf ;;
   *)            usage >&2; die "subcomando desconhecido: $1" ;;
 esac
