@@ -36,9 +36,9 @@
 # trailer, dedup e cap vivem lá; wos não duplica essa lógica.
 # Pendências: attn --tsv é a fonte (gates, msgs, agents esperando, órfãos);
 # wos não duplica essa coleta.
-# Fila: issues Todo do team (WORK_LINEAR_TEAM, default HEN), na ordem que o
-# linear-sync consome: prioridade Linear (urgent→low, sem prioridade por
-# último), depois key — contrato compartilhado com o linear-sync.
+# Fila: `linear-sync --queue --json` é a fonte (HEN-57) — a ordenação
+# (prioridade Linear urgent→low, sem prioridade por último, depois key) é
+# computada num único lugar; wos só rendera a saída.
 
 set -o pipefail
 
@@ -71,15 +71,16 @@ sibling() {
 #   run:<KEY>    worktree ativo vinculado (handle = pane p/ focar)
 #   queue:<KEY>  issue em Todo, na ordem do linear-sync
 gather_rows() {
-  local ps_json issues_json terms_json
+  local ps_json queue_json terms_json linear_sync_bin
   ps_json=$(orca worktree ps --json 2>&1)
   print -r -- "$ps_json" | grep -q '"ok": *true' ||
     die "runtime do Orca fora do ar? tente \`orca open\`"
-  issues_json=$(orca linear list --filter open --team "$TEAM" --limit 100 --json 2>/dev/null)
+  linear_sync_bin=$(sibling linear-sync)
+  queue_json=$(WORK_LINEAR_TEAM="$TEAM" "$linear_sync_bin" --queue --json 2>/dev/null)
   terms_json=$(orca terminal list --json 2>/dev/null)
 
-  TEAM="$TEAM" python3 - "$ps_json" "$issues_json" "$terms_json" <<'PY'
-import json, os, sys
+  python3 - "$ps_json" "$queue_json" "$terms_json" <<'PY'
+import json, sys
 
 def load(raw):
     try:
@@ -88,8 +89,7 @@ def load(raw):
     except Exception:
         return {}
 
-ps, issues, terms = (load(a) for a in sys.argv[1:4])
-team = os.environ["TEAM"]
+ps, queue, terms = (load(a) for a in sys.argv[1:4])
 
 by_worktree = {}
 for t in terms.get("terminals", []):
@@ -120,23 +120,12 @@ for w in ps.get("worktrees", []):
     else:
         print(f'run:{key}\t{handle}\t{icon} {key} · {st} · {agents} · {branch}{pr_s}')
 
-# fila: Todo do team — mesma chave de ordenação do linear-sync
-# (contrato: prioridade Linear, depois key; manter em sincronia lá).
-todo = []
-for i in issues.get("issues", []):
-    if (i.get("state") or {}).get("name") != "Todo":
-        continue
-    if (i.get("team") or {}).get("key") != team:
-        continue
-    p = i.get("priority") or 0
-    try:
-        num = int(i["identifier"].rsplit("-", 1)[-1])
-    except ValueError:
-        num = 10**9
-    todo.append((0 if p else 1, p, num, i["identifier"], i.get("title", "")))
-prio = {0: "—", 1: "P1", 2: "P2", 3: "P3", 4: "P4"}
-for _, p, _, key, title in sorted(todo):
-    print(f'queue:{key}\t\t○ {key} · {prio.get(p, "?")} · {title[:80]}')
+# fila: já ordenada por `linear-sync --queue --json` (HEN-57) — wos só rendera.
+for item in queue.get("queue", []):
+    key = item["key"]
+    label = item.get("priorityLabel", "?")
+    title = item.get("title", "")
+    print(f'queue:{key}\t\t○ {key} · {label} · {title[:80]}')
 PY
 }
 

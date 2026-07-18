@@ -5,6 +5,10 @@
 #   linear-sync              processa todas as issues Todo do team
 #   linear-sync --only KEY   processa somente a issue KEY
 #   linear-sync --dry-run    relata o que faria, sem criar nem mutar nada
+#   linear-sync --queue --json
+#                             só computa e emite a fila ordenada (sem spawnar
+#                             nem mutar nada) — contrato único da ordenação;
+#                             consumido pelo wos, que não a reimplementa.
 #
 # Gate: só issues do team (WORK_LINEAR_TEAM, default HEN) em estado Todo.
 # Agente: LINEAR_SYNC_AGENT (default claude) — qualquer TUI agent que o Orca
@@ -94,10 +98,14 @@ EOF
 # ---------- args ----------
 dry_run=0
 only=""
+queue_mode=0
+json_out=0
 while (( $# )); do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --dry-run) dry_run=1 ;;
+    --queue) queue_mode=1 ;;
+    --json) json_out=1 ;;
     --only)
       shift
       [[ -n "$1" ]] || die "--only requer uma issue key (ex.: HEN-42)"
@@ -108,11 +116,47 @@ while (( $# )); do
   shift
 done
 
+(( queue_mode )) && [[ "$json_out" -ne 1 ]] && die "--queue requer --json (único formato de saída suportado)"
+
 [[ "$CAP" == <-> ]] || die "LINEAR_SYNC_CAP inválido: $CAP"
 [[ -z "$MODEL_OVERRIDE" || ${VALID_MODELS[(Ie)$MODEL_OVERRIDE]} -gt 0 ]] ||
   die "LINEAR_SYNC_MODEL inválido: $MODEL_OVERRIDE (use: $VALID_MODELS)"
 [[ -z "$EFFORT_OVERRIDE" || ${VALID_EFFORTS[(Ie)$EFFORT_OVERRIDE]} -gt 0 ]] ||
   die "LINEAR_SYNC_EFFORT inválido: $EFFORT_OVERRIDE (use: $VALID_EFFORTS)"
+
+issues_raw=$(orca linear list --filter open --team "$TEAM" --limit 100 --json 2>&1)
+json_ok "$issues_raw" || die "falha em \`orca linear list\`"
+
+# ---------- --queue --json: só computa e emite a fila, sem mutar nada ----------
+# Contrato único da ordenação (aceite HEN-57): prioridade Linear urgent→low,
+# sem prioridade por último; desempate pelo número da key. wos consome esta
+# saída em vez de recalcular a chave de ordenação.
+if (( queue_mode )); then
+  RAW="$issues_raw" TEAM="$TEAM" python3 - <<'PY'
+import json, os
+d = json.loads(os.environ["RAW"], strict=False)
+team = os.environ["TEAM"]
+todo = []
+for i in d.get("result", {}).get("issues", []):
+    if (i.get("state") or {}).get("name") != "Todo":
+        continue
+    if (i.get("team") or {}).get("key") != team:
+        continue
+    p = i.get("priority") or 0
+    try:
+        num = int(i["identifier"].rsplit("-", 1)[-1])
+    except ValueError:
+        num = 10**9
+    todo.append((0 if p else 1, p, num, i["identifier"], i.get("title") or ""))
+prio_label = {0: "—", 1: "P1", 2: "P2", 3: "P3", 4: "P4"}
+queue = [
+    {"key": key, "priority": p, "priorityLabel": prio_label.get(p, "?"), "title": title}
+    for _, p, _, key, title in sorted(todo)
+]
+print(json.dumps({"ok": True, "result": {"queue": queue}}))
+PY
+  exit 0
+fi
 
 # ---------- estado atual: repos, worktrees, issues ----------
 repos_raw=$(orca repo list --json 2>&1)
@@ -148,9 +192,6 @@ PY
 )
 typeset -a linked=( ${(f)linked_lines} )
 running=${#linked[@]}
-
-issues_raw=$(orca linear list --filter open --team "$TEAM" --limit 100 --json 2>&1)
-json_ok "$issues_raw" || die "falha em \`orca linear list\`"
 
 # Candidatas: estado Todo no team. Fila ordenada por prioridade Linear
 # (urgent→low, sem prioridade por último), depois por key (FIFO aproximado).
