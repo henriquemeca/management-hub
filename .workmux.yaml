@@ -5,5 +5,7 @@
 base_branch: dev
 main_branch: dev
 
-post_create:
-  - make link
+# NUNCA rodar `make link` em post_create: o worktree sequestraria os symlinks
+# globais de ~/.local/bin e o ship os deixaria dangling ao remover o worktree
+# (bug pego em dogfood no primeiro ciclo completo). O link pertence ao
+# checkout canônico (~/github/management-hub), uma vez.
