@@ -24,7 +24,8 @@
 #
 # Guard-rails (ifs, não julgamento — nenhum tem --force):
 #   - recusa worktree com mudanças não commitadas (git status --porcelain sujo)
-#   - recusa worktree sem upstream configurado ou com commits não pushados
+#   - recusa worktree com commits não pushados (sem upstream = normal
+#     pós-merge com --delete-branch; o gate de PR MERGED é a prova)
 #   - recusa rodar de dentro da própria worktree (não se auto-remover)
 #
 # Idempotente: issue já Done vira no-op nos passos 1-3; worktree já removida
@@ -105,8 +106,24 @@ slug="${info_lines[4]}"
 if [[ "$state_name" == "Done" ]]; then
   print "= $key · já está Done — pulando passos 1-3"
 else
+  # Fallback: sem URL na issue, achar o PR pela branch (slug) via gh no repo —
+  # agentes nem sempre comentam o link (pego em dogfood na HEN-31/85).
+  if [[ "$pr_url" == "-" && "$repo_key" != "-" && "$slug" != "-" ]]; then
+    _fb_path=$(REPO_KEY="$repo_key" REPOS_JSON="$REPOS_JSON" python3 -c '
+import json, os
+try:
+    print(json.load(open(os.environ["REPOS_JSON"])).get(os.environ["REPO_KEY"], ""))
+except Exception:
+    print("")')
+    if [[ -d "$_fb_path" ]]; then
+      pr_url=$(cd "$_fb_path" && gh pr list --head "$slug" --state all \
+        --json url --jq '.[0].url // empty' 2>/dev/null)
+      [[ -n "$pr_url" ]] &&
+        print "= $key · PR achado pela branch '$slug' via gh: $pr_url" || pr_url="-"
+    fi
+  fi
   [[ "$pr_url" != "-" ]] ||
-    die "nenhum PR encontrado na issue $key (description/comentários) — comente a URL do PR antes de rodar ship"
+    die "nenhum PR encontrado na issue $key nem pela branch '$slug' via gh — comente a URL do PR antes de rodar ship"
 
   if (( force )); then
     print "⚠ $key · --force: pulando o gate de PR MERGED (PR: $pr_url)"
@@ -169,13 +186,17 @@ dirty=$(git -C "$wt_path" status --porcelain 2>&1)
 [[ -n "$dirty" ]] &&
   die "worktree $wt_path tem mudanças não commitadas — commit ou descarte antes de rodar ship:"$'\n'"$dirty"
 
-upstream=$(git -C "$wt_path" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>&1)
-if [[ $? -ne 0 ]]; then
-  die "worktree $wt_path sem branch upstream configurado — dê push antes de rodar ship"
+upstream=$(git -C "$wt_path" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)
+if [[ -z "$upstream" ]]; then
+  # Sem upstream é o estado NORMAL pós-merge: o PR (gate do passo 2) entrou com
+  # --delete-branch e a remota morreu. A prova de integração é o PR MERGED,
+  # não o upstream — seguir com aviso. (Falso positivo pego na HEN-57/85.)
+  print "= $key · branch sem upstream (remota deletada pós-merge) — PR MERGED é a prova de integração"
+else
+  ahead=$(git -C "$wt_path" rev-list --count '@{u}..HEAD' 2>&1)
+  [[ "$ahead" == <-> && "$ahead" -gt 0 ]] &&
+    die "worktree $wt_path tem $ahead commit(s) não pushado(s) — dê push antes de rodar ship"
 fi
-ahead=$(git -C "$wt_path" rev-list --count '@{u}..HEAD' 2>&1)
-[[ "$ahead" == <-> && "$ahead" -gt 0 ]] &&
-  die "worktree $wt_path tem $ahead commit(s) não pushado(s) — dê push antes de rodar ship"
 
 # ---------- 5: remove worktree + janela tmux + branch ----------
 # Sempre --force no workmux: os guard-rails do ship (worktree limpa, pushed,
